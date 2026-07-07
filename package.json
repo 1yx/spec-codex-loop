@@ -1,0 +1,10 @@
+{
+  "name": "spec-codex-loop",
+  "version": "0.1.0",
+  "description": "pi extension: autonomous TODO.md -> OpenSpec -> PR -> Codex review -> merge loop",
+  "license": "MIT",
+  "keywords": ["pi-package"],
+  "pi": {
+    "extensions": ["./dev-loop.ts"]
+  }
+}
