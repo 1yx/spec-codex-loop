@@ -18,7 +18,7 @@
  * (write spec, implement, address review) is delegated to pi's own agent
  * loop one bounded turn at a time.
  */
-import { readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
@@ -400,6 +400,62 @@ async function runTask(
   return true;
 }
 
+// --- project init (/loop init) ------------------------------------------------
+async function initProject(pi: ExtensionAPI, ctx: any) {
+  const cwd = ctx.cwd as string;
+
+  // 1. TODO.md — the loop's private task backlog.
+  const todoPath = join(cwd, "TODO.md");
+  if (existsSync(todoPath)) {
+    ctx.ui.notify("dev-loop: TODO.md already exists", "info");
+  } else {
+    writeFileSync(
+      todoPath,
+      [
+        "# TODO",
+        "",
+        "<!-- spec-codex-loop: add one task per line. Each task line must start",
+        "     with: dash, space, open-bracket, space, close-bracket, space, then",
+        "     the task text. Example tasks are intentionally not written as literal",
+        "     checkbox lines so the loop does not pick them up. -->",
+        "",
+      ].join("\n")
+    );
+    ctx.ui.notify("dev-loop: created TODO.md", "info");
+  }
+
+  // 2. Keep TODO.md out of git via the local-only exclude (not a committed .gitignore).
+  const { stdout: gitDir, code: gitCode } = await run(pi, "git", ["rev-parse", "--git-dir"]);
+  if (gitCode !== 0 || !gitDir) {
+    ctx.ui.notify("dev-loop: not a git repo; skipped .git/info/exclude", "warning");
+  } else {
+    const absGitDir = gitDir.startsWith("/") ? gitDir : join(cwd, gitDir);
+    const excludePath = join(absGitDir, "info", "exclude");
+    try {
+      const cur = existsSync(excludePath) ? readFileSync(excludePath, "utf-8") : "";
+      const already = cur.split("\n").some((l) => l.trim() === "TODO.md");
+      if (already) {
+        ctx.ui.notify("dev-loop: TODO.md already in .git/info/exclude", "info");
+      } else {
+        const prefix = cur && !cur.endsWith("\n") ? "\n" : "";
+        writeFileSync(excludePath, `${cur}${prefix}\n# spec-codex-loop (local-only)\nTODO.md\n`);
+        ctx.ui.notify("dev-loop: added TODO.md to .git/info/exclude", "info");
+      }
+    } catch (e) {
+      ctx.ui.notify(`dev-loop: could not update .git/info/exclude: ${String(e)}`, "warning");
+    }
+  }
+
+  // 3. OpenSpec scaffolding, non-interactive and pi-targeted.
+  if (existsSync(join(cwd, "openspec"))) {
+    ctx.ui.notify("dev-loop: openspec/ already present", "info");
+  } else {
+    const { code, stderr } = await run(pi, "openspec", ["init", "--tools", "pi"]);
+    if (code === 0) ctx.ui.notify("dev-loop: ran `openspec init --tools pi`", "info");
+    else ctx.ui.notify(`dev-loop: openspec init failed: ${stderr}`, "error");
+  }
+}
+
 // --- entry point ---------------------------------------------------------------
 export default function (pi: ExtensionAPI) {
   pi.on("agent_end", () => {
@@ -414,6 +470,10 @@ export default function (pi: ExtensionAPI) {
     handler: async (args, ctx) => {
       const argv = String(args ?? "").trim();
       const tokens = argv.split(/\s+/).filter(Boolean);
+      if (tokens[0] === "init") {
+        await initProject(pi, ctx);
+        return;
+      }
       const dryRun = tokens.includes("--dry-run");
       const all = tokens.includes("--all");
       const yes = tokens.includes("--yes");

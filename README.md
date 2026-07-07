@@ -49,6 +49,7 @@ Then `/reload` inside pi (or restart) to pick it up.
 ## Usage
 
 ```
+/loop init             First-time setup: create TODO.md, git-ignore it locally, openspec init
 /loop                  Run the next TODO task end-to-end, then stop
 /loop --dry-run        Build phase only; skip push / PR / review / merge (safe first run)
 /loop --all            Keep pulling tasks until TODO.md has none left
@@ -56,6 +57,10 @@ Then `/reload` inside pi (or restart) to pick it up.
 /loop --yes            Skip the pre-merge confirmation
 /loop "one-off task"   Run a task not from TODO.md
 ```
+
+### First-time setup (per project)
+
+Run `/loop init` once in a new project. It creates `TODO.md`, adds it to `.git/info/exclude` (kept out of git locally, not committed), and runs `openspec init --tools pi`. Idempotent — safe to re-run.
 
 ### `TODO.md` format
 
@@ -71,7 +76,7 @@ On merge, the matched line flips to `- [x]`. If no `TODO.md` (or no unchecked li
 ## Preconditions
 
 - `git`, `gh` (authenticated), and `openspec` on `PATH`
-- Repo root has an `openspec/` directory (run `openspec init` if not)
+- Repo root has an `openspec/` directory — run `/loop init` to scaffold it (plus `TODO.md` + local gitignore) in a new project
 - Default branch is `main`; `origin` points at your repo
 
 ## Behavior & guardrails
