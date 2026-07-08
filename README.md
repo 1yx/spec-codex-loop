@@ -2,18 +2,18 @@
 
 A [pi](https://pi.dev) extension that runs an **autonomous spec-driven PR loop** on `TODO.md`, gated by OpenAI Codex review.
 
-You stay inside pi the whole time. Type `/loop` and it pulls the next TODO task, builds it spec-first with OpenSpec, opens a PR, drives Codex review to a pass, merges, marks the task done, and moves on.
+You stay inside pi the whole time. Outside the loop you create an OpenSpec change (e.g. with the explore / grill-me skills) and add its name as a `- [ ] <change>` line in `TODO.md`. Then `/loop` spins up a dedicated git worktree for that change, implements it via the `openspec-apply-change` skill, opens a PR, drives Codex review to a pass, archives the change, merges, and removes the worktree.
 
 ## Flow
 
 ```
-TODO.md `- [ ]`  →  OpenSpec change  →  implement + test + commit
-                 →  push + gh pr create
-                 →  @codex review  →  fix per suggestions  →  push  (repeat until pass)
-                 →  gh pr merge --squash  →  mark `- [x]`  →  next task
+TODO.md `- [ ] <change>`  →  git worktree .worktree/<change> on branch <change>
+   →  openspec-apply-change (implement tasks + tests) → commit → push → gh pr create
+   →  @codex review  →  fix per suggestions  →  push  (repeat until Codex passes / repeats)
+   →  openspec archive  →  gh pr merge --squash  →  mark `- [x]`  →  remove worktree
 ```
 
-The **outer loop is deterministic TypeScript** (it cannot drift across multiple PRs). The fuzzy work — writing the spec, implementing, addressing review — is delegated to **pi's own agent loop**, one bounded turn at a time.
+The **outer loop is deterministic TypeScript** (it cannot drift across multiple PRs). The fuzzy work — implementing the change, addressing review — is delegated to **pi's own agent loop**, one bounded turn at a time, each scoped to the change's worktree.
 
 ## Codex review signal contract
 
@@ -49,51 +49,55 @@ Then `/reload` inside pi (or restart) to pick it up.
 ## Usage
 
 ```
-/loop init             First-time setup: create TODO.md, git-ignore it locally, openspec init
-/loop                  Run the next TODO task end-to-end, then stop
-/loop --dry-run        Build phase only; skip push / PR / review / merge (safe first run)
-/loop --all            Keep pulling tasks until TODO.md has none left
-/loop --max-rounds 8   Override Codex round cap (default 5)
+/loop init             First-time setup: create TODO.md, git-ignore TODO.md + .worktree/, openspec init
+/loop                  Run the next TODO change end-to-end, then stop
+/loop <change>         Run one specific change (not from TODO.md)
+/loop --dry-run        Build phase only; skip push / PR / review / archive / merge
+/loop --all            Keep pulling changes until TODO.md has none left
+/loop --max-rounds 8   Optional circuit breaker on review rounds (default: unbounded)
 /loop --yes            Skip the pre-merge confirmation
-/loop "one-off task"   Run a task not from TODO.md
 ```
 
 ### First-time setup (per project)
 
-Run `/loop init` once in a new project. It creates `TODO.md`, adds it to `.git/info/exclude` (kept out of git locally, not committed), and runs `openspec init --tools pi`. Idempotent — safe to re-run.
+Run `/loop init` once in a new project. It creates `TODO.md`, adds `TODO.md` + `.worktree/` to `.git/info/exclude` (kept out of git locally, not committed), and runs `openspec init --tools pi`. Idempotent — safe to re-run.
 
 ### `TODO.md` format
 
-Plain checkbox list at the repo root:
+One OpenSpec **change name** per checkbox line at the repo root (the filename `TODO.md` is matched case-insensitively):
 
 ```markdown
-- [ ] support multi-account cookie import
-- [ ] fix macOS login chain
+- [ ] add-user-auth
+- [ ] fix-macos-login-chain
 ```
 
-On merge, the matched line flips to `- [x]`. If no `TODO.md` (or no unchecked line) exists, the command exits with a notice.
+Each change must already exist under `openspec/changes/`. On merge, the matched line flips to `- [x]`.
 
 ## Preconditions
 
 - `git`, `gh` (authenticated), and `openspec` on `PATH`
 - Repo root has an `openspec/` directory — run `/loop init` to scaffold it (plus `TODO.md` + local gitignore) in a new project
+- Each TODO change exists under `openspec/changes/` in this repo (committed or not — if it isn't on `origin/main` yet, it is copied into the worktree and committed there)
 - Default branch is `main`; `origin` points at your repo
 
 ## Behavior & guardrails
 
-- **Stops, never blind-merges:** on Codex timeout (15 min), no agent progress in a round, or hitting `--max-rounds`, the PR is left open for a human.
+- **Worktree per change.** Each change gets `git worktree add .worktree/<change> -b <change> origin/main`; branch and worktree name equal the change name (no `feat/` prefix). All agent work is scoped to that worktree (the prompt gives the absolute path; a HEAD-advance check aborts if the agent commits outside it).
+- **Archive before merge.** Once Codex passes, `openspec archive <change>` folds the specs into `openspec/specs/` and moves the change to `archive/`, committed to the PR branch, then merged.
+- **Cleanup on success.** After `gh pr merge --squash --delete-branch`, the worktree is removed and its branch deleted. On any failure the PR **and** worktree are left for inspection.
+- **Keeps fixing until Codex passes.** Rounds are unbounded by default — it stays in the review→fix loop until Codex passes, **or** a stop fires: no Codex review after the wait (10 min), no agent progress in a round, a **repeating review** (same issues reappearing ⇒ fixes flip-flopping), or an explicit `--max-rounds N` cap.
 - **Merge confirmation** by default (interactive); `--yes` to auto-confirm.
-- **First push** uses `git push -u origin <branch>`; subsequent rounds use `git push`.
 - While `/loop` runs, don't type into pi manually — a stray message resolves the internal per-turn wait early. `Esc` aborts.
 
 ## Architecture
 
-- `pickTask` / `markDone` — `TODO.md` checkbox parse + flip (`node:fs`).
+- `findTodoFile` / `pickTask` / `markDone` — case-insensitive `TODO.md` checkbox parse + flip (`node:fs`).
+- `ensureLocalIgnore` / `removeWorktree` — `.git/info/exclude` + worktree/branch teardown helpers.
 - `driveAgent` — sends a user message and resolves on the next `agent_end`; one shared listener, no accumulation.
-- `pollCodex` — polls `gh api` every 60 s (≤15 min) for the bot's response to the current `@codex review` trigger.
+- `awaitCodexReview` — polls the bot's response to the current `@codex review` trigger every 10 min, retrying on empty up to 30 min.
 - `parseSuggestion` — strips `<sub>` / badge / bold markup → `{ severity, title, body, path, line }`.
-- `buildPhase` / `fixPhase` — the two agent-driven prompt types (spec+implement, and address-review).
-- `runTask` — the per-task pipeline; `/loop` iterates it.
+- `buildPhase` / `fixPhase` — agent-driven prompts scoped to the change's worktree (follow the `openspec-apply-change` skill; and address-review).
+- `runTask` — the per-change worktree pipeline (worktree → build → review loop → archive → merge → teardown); `/loop` iterates it.
 
 ## Not included (add when needed)
 
