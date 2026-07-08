@@ -55,7 +55,6 @@ Then `/reload` inside pi (or restart) to pick it up.
 /loop --dry-run        Build phase only; skip push / PR / review / archive / merge
 /loop --all            Keep pulling changes until TODO.md has none left
 /loop --max-rounds 8   Optional circuit breaker on review rounds (default: unbounded)
-/loop --yes            Skip the pre-merge confirmation
 ```
 
 ### First-time setup (per project)
@@ -86,7 +85,7 @@ Each change must already exist under `openspec/changes/`. On merge, the matched 
 - **Archive before merge.** Once Codex passes, `openspec archive <change>` folds the specs into `openspec/specs/` and moves the change to `archive/`, committed to the PR branch, then merged.
 - **Cleanup on success.** After `gh pr merge --squash --delete-branch`, the worktree is removed and its branch deleted. On any failure the PR **and** worktree are left for inspection.
 - **Keeps fixing until Codex passes.** Rounds are unbounded by default — it stays in the review→fix loop until Codex passes, **or** a stop fires: no Codex review after the wait (10 min), no agent progress in a round, a **repeating review** (same issues reappearing ⇒ fixes flip-flopping), or an explicit `--max-rounds N` cap.
-- **Merge confirmation** by default (interactive); `--yes` to auto-confirm.
+- **Merges automatically** once Codex passes (no confirmation) — archive → squash-merge → worktree teardown.
 - While `/loop` runs, don't type into pi manually — a stray message resolves the internal per-turn wait early. `Esc` aborts.
 
 ## Architecture

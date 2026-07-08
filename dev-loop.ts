@@ -19,7 +19,6 @@
  *   /loop --dry-run       build phase only; skip push/PR/review/archive/merge
  *   /loop --all           keep pulling changes from TODO.md until none left
  *   /loop --max-rounds N  optional circuit breaker on review rounds (default: unbounded)
- *   /loop --yes           skip the pre-merge confirmation
  *
  * The OUTER loop is deterministic TS (can't drift). The fuzzy work (implement,
  * address review) is delegated to pi's agent, one bounded turn at a time, each
@@ -316,7 +315,7 @@ async function runTask(
   pi: ExtensionAPI,
   ctx: any,
   change: string,
-  opts: { dryRun: boolean; maxRounds: number; yes: boolean }
+  opts: { dryRun: boolean; maxRounds: number }
 ): Promise<boolean> {
   const repoRoot = ctx.cwd as string;
   const wtDir = join(repoRoot, WORKTREE_ROOT, change);
@@ -471,14 +470,7 @@ async function runTask(
     await run(pi, "git", ["push"], wtDir);
   }
 
-  // Merge (confirm unless --yes).
-  if (!opts.yes && ctx.hasUI) {
-    const ok = await ctx.ui.confirm("dev-loop", `Merge PR #${prNum} to main (--squash)?`);
-    if (!ok) {
-      ctx.ui.notify("dev-loop: merge skipped by user; PR + worktree left", "info");
-      return false;
-    }
-  }
+  // Merge directly — Codex passed, so conditions are met.
   const { code: mergeCode, stderr: mergeErr } = await run(pi, "gh", [
     "pr", "merge", String(prNum), "--squash", "--delete-branch", "--repo", repo,
   ]);
@@ -539,7 +531,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.registerCommand("loop", {
     description:
-      "Autonomous OpenSpec-change → worktree → PR → Codex review → archive → merge loop. Flags: --dry-run --all --max-rounds N --yes",
+      "Autonomous OpenSpec-change → worktree → PR → Codex review → archive → merge loop. Flags: --dry-run --all --max-rounds N",
     handler: async (args, ctx) => {
       const argv = String(args ?? "").trim();
       const tokens = argv.split(/\s+/).filter(Boolean);
@@ -549,7 +541,6 @@ export default function (pi: ExtensionAPI) {
       }
       const dryRun = tokens.includes("--dry-run");
       const all = tokens.includes("--all");
-      const yes = tokens.includes("--yes");
       const mrIdx = tokens.indexOf("--max-rounds");
       const maxRounds = mrIdx >= 0 ? parseInt(tokens[mrIdx + 1] ?? "", 10) || DEFAULT_MAX_ROUNDS : DEFAULT_MAX_ROUNDS;
       const positional = tokens.filter((t) => !t.startsWith("--") && t !== tokens[mrIdx + 1]);
@@ -594,7 +585,7 @@ export default function (pi: ExtensionAPI) {
           ctx.ui.notify("dev-loop: no more changes", "info");
           break;
         }
-        const merged = await runTask(pi, ctx, item.text, { dryRun, maxRounds, yes });
+        const merged = await runTask(pi, ctx, item.text, { dryRun, maxRounds });
         if (merged && item.lineNo) markDone(cwd, item.lineNo);
         if (oneOff) break;
         if (!all) {
