@@ -133,6 +133,35 @@ async function removeWorktree(pi: ExtensionAPI, repoRoot: string, change: string
   await run(pi, "git", ["branch", "-D", change], repoRoot);
 }
 
+async function resolveRepo(pi: ExtensionAPI, repoRoot: string): Promise<string> {
+  const { stdout } = await run(pi, "gh", ["repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner"], repoRoot);
+  return stdout || "";
+}
+
+/** Open/merged PR state for a change's head branch (used for resume). */
+async function prStateFor(
+  pi: ExtensionAPI,
+  repo: string,
+  change: string
+): Promise<{ open: boolean; merged: boolean; prNum: number | null }> {
+  const lookup = async (state: string) => {
+    const { stdout } = await run(pi, "gh", [
+      "pr", "list", "--head", change, "--state", state, "--json", "number", "-q", ".[0].number", "--repo", repo,
+    ]);
+    return parseInt((stdout || "").trim(), 10) || null;
+  };
+  const openNum = await lookup("open");
+  if (openNum) return { open: true, merged: false, prNum: openNum };
+  const mergedNum = await lookup("merged");
+  if (mergedNum) return { open: false, merged: true, prNum: mergedNum };
+  return { open: false, merged: false, prNum: null };
+}
+
+/** True once `openspec archive` has moved the change out of openspec/changes/. */
+function isArchived(wtDir: string, change: string): boolean {
+  return !existsSync(join(wtDir, "openspec", "changes", change));
+}
+
 // --- agent drive: one listener, no accumulation --------------------------------
 let turnResolve: (() => void) | null = null;
 
@@ -322,31 +351,42 @@ async function runTask(
 
   ctx.ui.notify(`dev-loop: change → ${change} (worktree ${wtDir})`, "info");
 
-  if (existsSync(wtDir)) {
-    ctx.ui.notify(
-      `dev-loop: worktree already exists at ${wtDir}; remove it (\`git worktree remove\`) or resume, then re-run`,
-      "error"
-    );
-    return false;
-  }
-
   await ensureLocalIgnore(pi, repoRoot, `${WORKTREE_ROOT}/`);
 
-  // Fresh branch + worktree off origin/main.
-  const { stderr: fetchErr, code: fetchCode } = await run(pi, "git", ["fetch", "origin", "main"], repoRoot);
-  if (fetchCode !== 0) {
-    ctx.ui.notify(`dev-loop: git fetch origin main failed: ${fetchErr}`, "error");
+  // Resolve repo + detect prior-run state (for resume).
+  const repo = await resolveRepo(pi, repoRoot);
+  if (!repo) {
+    ctx.ui.notify("dev-loop: could not resolve repo via `gh repo view`", "error");
     return false;
   }
-  const { stderr: wtErr, code: wtCode } = await run(
-    pi,
-    "git",
-    ["worktree", "add", "-b", change, wtDir, "origin/main"],
-    repoRoot
-  );
-  if (wtCode !== 0) {
-    ctx.ui.notify(`dev-loop: git worktree add failed: ${wtErr}`, "error");
-    return false;
+  const pr = await prStateFor(pi, repo, change);
+
+  // Already merged in a prior run, but cleanup / TODO-mark didn't finish → finish up.
+  if (pr.merged) {
+    if (existsSync(wtDir)) await removeWorktree(pi, repoRoot, change);
+    ctx.ui.notify(`dev-loop: ${change} already merged in a prior run — cleaning up`, "info");
+    return true;
+  }
+
+  // Create the worktree only on a fresh run; a resume reuses the existing one.
+  if (!existsSync(wtDir)) {
+    const { stderr: fetchErr, code: fetchCode } = await run(pi, "git", ["fetch", "origin", "main"], repoRoot);
+    if (fetchCode !== 0) {
+      ctx.ui.notify(`dev-loop: git fetch origin main failed: ${fetchErr}`, "error");
+      return false;
+    }
+    const { stderr: wtErr, code: wtCode } = await run(
+      pi,
+      "git",
+      ["worktree", "add", "-b", change, wtDir, "origin/main"],
+      repoRoot
+    );
+    if (wtCode !== 0) {
+      ctx.ui.notify(`dev-loop: git worktree add failed: ${wtErr}`, "error");
+      return false;
+    }
+  } else {
+    ctx.ui.notify(`dev-loop: resuming — reusing worktree ${wtDir}`, "info");
   }
 
   // Ensure the openspec change is present in the worktree.
@@ -363,38 +403,28 @@ async function runTask(
     await run(pi, "git", ["commit", "-m", `spec: add ${change} change`], wtDir);
   }
 
-  // buildPhase (agent in worktree). Safety net: worktree HEAD must advance.
-  const { stdout: headBefore } = await run(pi, "git", ["rev-parse", "HEAD"], wtDir);
-  await buildPhase(pi, ctx, change, wtDir, opts.dryRun);
-  const { stdout: headAfter } = await run(pi, "git", ["rev-parse", "HEAD"], wtDir);
-  if (headBefore === headAfter) {
-    ctx.ui.notify("dev-loop: agent produced no commit in the worktree; aborting (worktree left)", "error");
-    return false;
-  }
-
+  // buildPhase — skip if a PR is already open (build shipped in a prior run).
   if (opts.dryRun) {
-    ctx.ui.notify(`dev-loop: --dry-run → stopping before push/PR (worktree left at ${wtDir})`, "info");
+    if (!pr.open) await buildPhase(pi, ctx, change, wtDir, true);
+    ctx.ui.notify(`dev-loop: --dry-run → stopping (worktree left at ${wtDir})`, "info");
     return false;
   }
-
-  // The agent pushed + opened the PR during buildPhase; look it up by head branch.
-  const { stdout: repoOut } = await run(pi, "gh", [
-    "repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner",
-  ], repoRoot);
-  const repo = repoOut || "";
-  if (!repo) {
-    ctx.ui.notify("dev-loop: could not resolve repo via `gh repo view`", "error");
-    return false;
+  let prNum: number;
+  if (pr.open) {
+    prNum = pr.prNum as number;
+    ctx.ui.notify(`dev-loop: resuming — PR #${prNum} already open`, "info");
+  } else {
+    await buildPhase(pi, ctx, change, wtDir, false);
+    // buildPhase must have opened a PR (also catches the agent working outside
+    // the worktree — no push of <change> ⇒ no PR).
+    const after = await prStateFor(pi, repo, change);
+    if (!after.open) {
+      ctx.ui.notify("dev-loop: no open PR after buildPhase; aborting (worktree left)", "error");
+      return false;
+    }
+    prNum = after.prNum as number;
   }
-  const { stdout: prOut } = await run(pi, "gh", [
-    "pr", "list", "--head", change, "--state", "open", "--json", "number", "-q", ".[0].number", "--repo", repo,
-  ]);
-  const prNum = parseInt(prOut.trim(), 10);
-  if (!prNum) {
-    ctx.ui.notify("dev-loop: agent did not open a PR; aborting (worktree left)", "error");
-    return false;
-  }
-  ctx.ui.notify(`dev-loop: PR #${prNum} found — starting Codex review loop`, "info");
+  ctx.ui.notify(`dev-loop: PR #${prNum} — starting Codex review loop`, "info");
 
   // Review loop — keeps fixing until Codex passes; git ops target the worktree.
   const seenSignatures: string[] = [];
@@ -457,17 +487,19 @@ async function runTask(
     }
   }
 
-  // Archive the change (fold specs into openspec/specs, move to archive/), then commit + push.
-  const { code: arcCode, stderr: arcErr } = await run(pi, "openspec", ["archive", change, "-y"], wtDir);
-  if (arcCode !== 0) {
-    ctx.ui.notify(`dev-loop: openspec archive failed: ${arcErr}; stopping (PR + worktree left)`, "warning");
-    return false;
-  }
-  const { stdout: dirty } = await run(pi, "git", ["status", "--porcelain"], wtDir);
-  if (dirty) {
-    await run(pi, "git", ["add", "-A"], wtDir);
-    await run(pi, "git", ["commit", "-m", `chore: archive ${change}`], wtDir);
-    await run(pi, "git", ["push"], wtDir);
+  // Archive the change (fold specs into openspec/specs, move to archive/). Idempotent on resume.
+  if (!isArchived(wtDir, change)) {
+    const { code: arcCode, stderr: arcErr } = await run(pi, "openspec", ["archive", change, "-y"], wtDir);
+    if (arcCode !== 0) {
+      ctx.ui.notify(`dev-loop: openspec archive failed: ${arcErr}; stopping (PR + worktree left)`, "warning");
+      return false;
+    }
+    const { stdout: dirty } = await run(pi, "git", ["status", "--porcelain"], wtDir);
+    if (dirty) {
+      await run(pi, "git", ["add", "-A"], wtDir);
+      await run(pi, "git", ["commit", "-m", `chore: archive ${change}`], wtDir);
+      await run(pi, "git", ["push"], wtDir);
+    }
   }
 
   // Merge directly — Codex passed, so conditions are met.
