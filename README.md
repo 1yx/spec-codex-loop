@@ -54,7 +54,6 @@ Then `/reload` inside pi (or restart) to pick it up.
 /loop <change>         Run one specific change (not from TODO.md)
 /loop --dry-run        Build phase only; skip push / PR / review / archive / merge
 /loop --all            Keep pulling changes until TODO.md has none left
-/loop --max-rounds 8   Optional circuit breaker on review rounds (default: unbounded)
 ```
 
 ### First-time setup (per project)
@@ -81,23 +80,23 @@ Each change must already exist under `openspec/changes/`. On merge, the matched 
 
 ## Behavior & guardrails
 
-- **Worktree per change.** Each change gets `git worktree add .worktree/<change> -b <change> origin/main`; branch and worktree name equal the change name (no `feat/` prefix). All agent work is scoped to that worktree (the prompt gives the absolute path; a HEAD-advance check aborts if the agent commits outside it).
+- **Worktree per change.** Each change gets `git worktree add .worktree/<change> -b <change> origin/main`; branch and worktree name equal the change name (no `feat/` prefix). All agent work is scoped to that worktree (the prompt gives the absolute path; buildPhase is gated on an open PR appearing, which also catches the agent working outside the worktree).
 - **Archive before merge.** Once Codex passes, `openspec archive <change>` folds the specs into `openspec/specs/` and moves the change to `archive/`, committed to the PR branch, then merged.
 - **Cleanup on success.** After `gh pr merge --squash --delete-branch`, the worktree is removed and its branch deleted. On any failure the PR **and** worktree are left for inspection.
 - **Resumable.** Re-running `/loop` (or `/loop <change>`) for an interrupted change picks up where it left off: it detects the existing worktree + PR state (none / open / merged) and the change's archived-ness, then skips completed stages and continues. A merged-but-uncleaned change just gets its worktree torn down and its TODO line marked.
-- **Keeps fixing until Codex passes.** Rounds are unbounded by default — it stays in the review→fix loop until Codex passes, **or** a stop fires: no Codex review after the wait (10 min), no agent progress in a round, a **repeating review** (same issues reappearing ⇒ fixes flip-flopping), or an explicit `--max-rounds N` cap.
+- **Keeps fixing until Codex passes.** Rounds are unbounded — it stays in the review→fix loop until Codex passes, **or** a stop fires: no Codex review after the wait (10 min), no agent progress in a round, or a **repeating review** (same issues reappearing ⇒ fixes flip-flopping).
 - **Merges automatically** once Codex passes (no confirmation) — archive → squash-merge → worktree teardown.
 - While `/loop` runs, don't type into pi manually — a stray message resolves the internal per-turn wait early. `Esc` aborts.
 
 ## Architecture
 
 - `findTodoFile` / `pickTask` / `markDone` — case-insensitive `TODO.md` checkbox parse + flip (`node:fs`).
-- `ensureLocalIgnore` / `removeWorktree` — `.git/info/exclude` + worktree/branch teardown helpers.
+- `ensureLocalIgnore` / `removeWorktree` / `prStateFor` — local gitignore, worktree/branch teardown, and PR-state (for resume) helpers.
 - `driveAgent` — sends a user message and resolves on the next `agent_end`; one shared listener, no accumulation.
 - `awaitCodexReview` — polls the bot's response to the current `@codex review` trigger every 10 min, retrying on empty up to 30 min.
 - `parseSuggestion` — strips `<sub>` / badge / bold markup → `{ severity, title, body, path, line }`.
 - `buildPhase` / `fixPhase` — agent-driven prompts scoped to the change's worktree (follow the `openspec-apply-change` skill; and address-review).
-- `runTask` — the per-change worktree pipeline (worktree → build → review loop → archive → merge → teardown); `/loop` iterates it.
+- `runTask` — the per-change pipeline (worktree → build → review loop → archive → merge → teardown), **state-driven for resume**: detects the worktree + PR state (none / open / merged) + archived-ness and skips completed stages. `/loop` iterates it.
 
 ## Not included (add when needed)
 
@@ -105,7 +104,6 @@ Each change must already exist under `openspec/changes/`. On merge, the matched 
 - The 👍-reaction pass path (the "Didn't find any major issues" comment covers the observed case).
 - Severity-based filtering (all suggestions are addressed; ignore P3 if you want).
 - Strict per-artifact OpenSpec gating (proposal / specs / design / tasks) — the agent currently decides artifact depth.
-- A `package.json` `pi` manifest for `pi install git:…` distribution.
 
 ## License
 

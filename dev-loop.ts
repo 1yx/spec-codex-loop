@@ -18,7 +18,6 @@
  *   /loop <change>        run one specific change (not from TODO.md)
  *   /loop --dry-run       build phase only; skip push/PR/review/archive/merge
  *   /loop --all           keep pulling changes from TODO.md until none left
- *   /loop --max-rounds N  optional circuit breaker on review rounds (default: unbounded)
  *
  * The OUTER loop is deterministic TS (can't drift). The fuzzy work (implement,
  * address review) is delegated to pi's agent, one bounded turn at a time, each
@@ -30,7 +29,6 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 const CODEX_LOGIN = "chatgpt-codex-connector"; // bot login prefix; API may append "[bot]"
 const PASS_RE = /Didn't find any major issues/i;
-const DEFAULT_MAX_ROUNDS = Infinity; // default: no cap; `--max-rounds N` sets an optional circuit breaker
 const REVIEW_WAIT_MS = 10 * 60_000; // poll interval between Codex fetches
 const REVIEW_TOTAL_TIMEOUT_MS = 30 * 60_000; // cap per round (~3 intervals); raise to be more patient
 const WORKTREE_ROOT = ".worktree";
@@ -133,11 +131,6 @@ async function removeWorktree(pi: ExtensionAPI, repoRoot: string, change: string
   await run(pi, "git", ["branch", "-D", change], repoRoot);
 }
 
-async function resolveRepo(pi: ExtensionAPI, repoRoot: string): Promise<string> {
-  const { stdout } = await run(pi, "gh", ["repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner"], repoRoot);
-  return stdout || "";
-}
-
 /** Open/merged PR state for a change's head branch (used for resume). */
 async function prStateFor(
   pi: ExtensionAPI,
@@ -155,11 +148,6 @@ async function prStateFor(
   const mergedNum = await lookup("merged");
   if (mergedNum) return { open: false, merged: true, prNum: mergedNum };
   return { open: false, merged: false, prNum: null };
-}
-
-/** True once `openspec archive` has moved the change out of openspec/changes/. */
-function isArchived(wtDir: string, change: string): boolean {
-  return !existsSync(join(wtDir, "openspec", "changes", change));
 }
 
 // --- agent drive: one listener, no accumulation --------------------------------
@@ -344,7 +332,7 @@ async function runTask(
   pi: ExtensionAPI,
   ctx: any,
   change: string,
-  opts: { dryRun: boolean; maxRounds: number }
+  dryRun: boolean
 ): Promise<boolean> {
   const repoRoot = ctx.cwd as string;
   const wtDir = join(repoRoot, WORKTREE_ROOT, change);
@@ -354,7 +342,8 @@ async function runTask(
   await ensureLocalIgnore(pi, repoRoot, `${WORKTREE_ROOT}/`);
 
   // Resolve repo + detect prior-run state (for resume).
-  const repo = await resolveRepo(pi, repoRoot);
+  const { stdout: repoOut } = await run(pi, "gh", ["repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner"], repoRoot);
+  const repo = repoOut || "";
   if (!repo) {
     ctx.ui.notify("dev-loop: could not resolve repo via `gh repo view`", "error");
     return false;
@@ -404,7 +393,7 @@ async function runTask(
   }
 
   // buildPhase — skip if a PR is already open (build shipped in a prior run).
-  if (opts.dryRun) {
+  if (dryRun) {
     if (!pr.open) await buildPhase(pi, ctx, change, wtDir, true);
     ctx.ui.notify(`dev-loop: --dry-run → stopping (worktree left at ${wtDir})`, "info");
     return false;
@@ -428,7 +417,7 @@ async function runTask(
 
   // Review loop — keeps fixing until Codex passes; git ops target the worktree.
   const seenSignatures: string[] = [];
-  for (let round = 1; round <= opts.maxRounds; round++) {
+  for (let round = 1; ; round++) {
     const since = new Date().toISOString();
     const { code: trigCode, stderr: trigErr } = await run(pi, "gh", [
       "pr", "comment", String(prNum), "--body", "@codex review", "--repo", repo,
@@ -478,17 +467,10 @@ async function runTask(
       return false;
     }
     await run(pi, "git", ["push"], wtDir);
-    if (round === opts.maxRounds) {
-      ctx.ui.notify(
-        `dev-loop: hit max-rounds (${opts.maxRounds}) without Codex pass; stopping (PR + worktree left)`,
-        "warning"
-      );
-      return false;
-    }
   }
 
   // Archive the change (fold specs into openspec/specs, move to archive/). Idempotent on resume.
-  if (!isArchived(wtDir, change)) {
+  if (existsSync(wtChangeDir)) {
     const { code: arcCode, stderr: arcErr } = await run(pi, "openspec", ["archive", change, "-y"], wtDir);
     if (arcCode !== 0) {
       ctx.ui.notify(`dev-loop: openspec archive failed: ${arcErr}; stopping (PR + worktree left)`, "warning");
@@ -563,7 +545,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.registerCommand("loop", {
     description:
-      "Autonomous OpenSpec-change → worktree → PR → Codex review → archive → merge loop. Flags: --dry-run --all --max-rounds N",
+      "Autonomous OpenSpec-change → worktree → PR → Codex review → archive → merge loop. Flags: --dry-run --all",
     handler: async (args, ctx) => {
       const argv = String(args ?? "").trim();
       const tokens = argv.split(/\s+/).filter(Boolean);
@@ -573,9 +555,7 @@ export default function (pi: ExtensionAPI) {
       }
       const dryRun = tokens.includes("--dry-run");
       const all = tokens.includes("--all");
-      const mrIdx = tokens.indexOf("--max-rounds");
-      const maxRounds = mrIdx >= 0 ? parseInt(tokens[mrIdx + 1] ?? "", 10) || DEFAULT_MAX_ROUNDS : DEFAULT_MAX_ROUNDS;
-      const positional = tokens.filter((t) => !t.startsWith("--") && t !== tokens[mrIdx + 1]);
+      const positional = tokens.filter((t) => !t.startsWith("--"));
       const oneOff = positional.join(" ").trim(); // a change name, run directly
 
       const cwd = ctx.cwd as string;
@@ -617,7 +597,7 @@ export default function (pi: ExtensionAPI) {
           ctx.ui.notify("dev-loop: no more changes", "info");
           break;
         }
-        const merged = await runTask(pi, ctx, item.text, { dryRun, maxRounds });
+        const merged = await runTask(pi, ctx, item.text, dryRun);
         if (merged && item.lineNo) markDone(cwd, item.lineNo);
         if (oneOff) break;
         if (!all) {
