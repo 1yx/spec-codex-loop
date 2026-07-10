@@ -15,7 +15,7 @@
  *
  * Usage (inside pi):
  *   /loop                 run the next TODO change end-to-end, then stop
- *   /loop <change>        run one specific change (not from TODO.md)
+ *   /loop <change>        run a specific change (added to TODO.md if absent)
  *   /loop --dry-run       build phase only; skip push/PR/review/archive/merge
  *   /loop --all           keep pulling changes from TODO.md until none left
  *
@@ -106,6 +106,22 @@ function markDone(cwd: string, lineNo: number) {
     lines[lineNo - 1] = lines[lineNo - 1].replace(/-\s*\[\s\]/, "- [x]");
     writeFileSync(file, lines.join("\n"));
   }
+}
+
+/** Ensure <change> is an unchecked `- [ ]` line in the todo file; return its 1-indexed line number. */
+function ensureTodoEntry(cwd: string, change: string): number {
+  const file = findTodoFile(cwd) ?? join(cwd, "TODO.md");
+  const raw = existsSync(file) ? readFileSync(file, "utf-8") : "";
+  const lines = raw.split("\n");
+  const matches = (l: string) => {
+    const m = l.match(/^\s*-\s*\[[ xX]\]\s+(.+?)\s*$/);
+    return !!m && m[1].trim() === change;
+  };
+  const idx = lines.findIndex(matches);
+  if (idx >= 0) return idx + 1;
+  const prefix = raw && !raw.endsWith("\n") ? "\n" : "";
+  writeFileSync(file, `${raw}${prefix}- [ ] ${change}\n`);
+  return raw.split("\n").length + (prefix ? 1 : 0);
 }
 
 /** Append `entry` to .git/info/exclude (local-only) if not already present. Best-effort. */
@@ -378,9 +394,17 @@ async function runTask(
     ctx.ui.notify(`dev-loop: resuming — reusing worktree ${wtDir}`, "info");
   }
 
-  // Ensure the openspec change is present in the worktree.
+  // Ensure openspec is present in the worktree. The worktree is created from
+  // origin/main, so if openspec isn't there yet (git-ignored, or just never
+  // committed), copy the whole dir from the main repo — not committed, since in
+  // the ignored case `git add` can't and in the merely-untracked case
+  // scaffolding shouldn't pollute the PR. Otherwise, if openspec is on main but
+  // this change isn't, bring in just the change dir and commit it on the branch.
   const wtChangeDir = join(wtDir, "openspec", "changes", change);
-  if (!existsSync(wtChangeDir)) {
+  if (!existsSync(join(wtDir, "openspec"))) {
+    cpSync(join(repoRoot, "openspec"), join(wtDir, "openspec"), { recursive: true });
+    ctx.ui.notify("dev-loop: no openspec/ in worktree — copied openspec/ from main repo", "info");
+  } else if (!existsSync(wtChangeDir)) {
     const srcChangeDir = join(repoRoot, "openspec", "changes", change);
     if (!existsSync(srcChangeDir)) {
       ctx.ui.notify(`dev-loop: openspec change "${change}" not found under openspec/changes/; aborting`, "error");
@@ -588,7 +612,8 @@ export default function (pi: ExtensionAPI) {
       while (true) {
         let item: { text: string; lineNo: number | null } | null;
         if (oneOff) {
-          item = { text: oneOff, lineNo: null };
+          const lineNo = ensureTodoEntry(cwd, oneOff);
+          item = { text: oneOff, lineNo };
         } else {
           const t = pickTask(cwd);
           item = t ? { text: t.text, lineNo: t.lineNo } : null;

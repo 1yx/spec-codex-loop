@@ -51,7 +51,7 @@ Then `/reload` inside pi (or restart) to pick it up.
 ```
 /loop init             First-time setup: create TODO.md, git-ignore TODO.md + .worktree/, openspec init
 /loop                  Run the next TODO change end-to-end, then stop
-/loop <change>         Run one specific change (not from TODO.md)
+/loop <change>         Run a specific change (added to TODO.md if absent, then run)
 /loop --dry-run        Build phase only; skip push / PR / review / archive / merge
 /loop --all            Keep pulling changes until TODO.md has none left
 ```
@@ -76,12 +76,13 @@ Each change must already exist under `openspec/changes/`. On merge, the matched 
 - `git`, `gh` (authenticated), and `openspec` on `PATH`
 - Repo root has an `openspec/` directory — run `/loop init` to scaffold it (plus `TODO.md` + local gitignore) in a new project
 - Each TODO change exists under `openspec/changes/` in this repo (committed or not — if it isn't on `origin/main` yet, it is copied into the worktree and committed there)
+- If the worktree (created from `origin/main`) has no `openspec/` at all — e.g. `openspec` is git-ignored, or just never committed — the whole `openspec/` dir is copied in from the main repo instead (untracked, so it doesn't pollute the PR)
 - Default branch is `main`; `origin` points at your repo
 
 ## Behavior & guardrails
 
 - **Worktree per change.** Each change gets `git worktree add .worktree/<change> -b <change> origin/main`; branch and worktree name equal the change name (no `feat/` prefix). All agent work is scoped to that worktree (the prompt gives the absolute path; buildPhase is gated on an open PR appearing, which also catches the agent working outside the worktree).
-- **Archive before merge.** Once Codex passes, `openspec archive <change>` folds the specs into `openspec/specs/` and moves the change to `archive/`, committed to the PR branch, then merged.
+- **Archive before merge.** Once Codex passes, `openspec archive <change>` folds the specs into `openspec/specs/` and moves the change to `archive/`, committed to the PR branch, then merged. (When `openspec/` came in via the whole-dir copy — untracked — archive output is untracked too; specs stay local, which is the point of keeping `openspec` out of `origin/main`.)
 - **Cleanup on success.** After `gh pr merge --squash --delete-branch`, the worktree is removed and its branch deleted. On any failure the PR **and** worktree are left for inspection.
 - **Resumable.** Re-running `/loop` (or `/loop <change>`) for an interrupted change picks up where it left off: it detects the existing worktree + PR state (none / open / merged) and the change's archived-ness, then skips completed stages and continues. A merged-but-uncleaned change just gets its worktree torn down and its TODO line marked.
 - **Keeps fixing until Codex passes.** Rounds are unbounded — it stays in the review→fix loop until Codex passes, **or** a stop fires: no Codex review after the wait (10 min), no agent progress in a round, or a **repeating review** (same issues reappearing ⇒ fixes flip-flopping).
