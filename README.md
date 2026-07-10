@@ -71,6 +71,16 @@ One OpenSpec **change name** per checkbox line at the repo root (the filename `T
 
 Each change must already exist under `openspec/changes/`. On merge, the matched line flips to `- [x]`.
 
+### Why a separate `TODO.md` (not `openspec list`)
+
+OpenSpec already knows what's done — `openspec archive` moves a change out of `openspec/changes/`, so `openspec list` could serve as the queue on its own. We keep a separate `TODO.md` anyway, for one reason: **ordering belongs outside the change name.**
+
+- **OpenSpec rejects ordered names.** `validateChangeName` requires names to start with a lowercase letter — `01-add-auth` → `✖ Change name must start with a letter` (verified on OpenSpec 1.2.0). And `openspec list` only sorts by `recent` (last-modified, jittery on every edit) or `name` (alphabetic, no priority). So there's no in-band way to say "do this before that."
+- **The community agrees names shouldn't carry ordering.** The numeric-prefix request ([Fission-AI/OpenSpec#850](https://github.com/Fission-AI/OpenSpec/issues/850)) — `100-audit → 200-implement → 300-validate` for tiers, `101-01/02` for parallel batches within a tier — was pushed back on precisely because it "couples naming with execution concerns" and turns the name into "a container for orchestration metadata." The stance: change names are **identifiers**, not sequencing. The only in-band workaround is a letter prefix (`s-001-…`, `p100-…`), which still pollutes the identifier.
+- **Markdown carries ordering natively, names can't.** The three-digit scheme exists *only* because an OpenSpec name has nowhere else to encode sequence + grouping. `TODO.md` is a free-form ordered document: sequence is line order, grouping/parallelism is nesting — with the change name left clean.
+
+Net: change name = **what** (stable identifier); `TODO.md` = **in what order** (the sequencing layer). Completion stays a single source of truth in `archive`; the `- [x]` flip is a convenience marker, not the record.
+
 ## Preconditions
 
 - `git`, `gh` (authenticated), and `openspec` on `PATH`
