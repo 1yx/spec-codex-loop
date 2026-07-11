@@ -43,10 +43,36 @@ interface Suggestion {
 interface PollResult {
   pass: boolean;
   timeout: boolean;
+  stopped: boolean;
   suggestions: Suggestion[];
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+// --- /loop subcommand control flags -------------------------------------------
+// Set by `/loop stop` / `/loop fetch` while a run is in flight; read at loop
+// checkpoints. stopRequested aborts at the next safe boundary (current poll
+// interval or agent-turn end); fetchRequested wakes the Codex poll early.
+// /loop resume re-enters runTask for `interruptedChange`.
+let stopRequested = false;
+let fetchRequested = false;
+let interruptedChange: string | null = null;
+const POLL_TICK_MS = 1000;
+
+/** Like sleep(), but wakes every POLL_TICK_MS to check stop/fetch flags.
+ *  Returns "stop" / "fetch" if the flag fired (fetch flag is consumed), else "ok". */
+async function sleepPoll(ms: number): Promise<"ok" | "fetch" | "stop"> {
+  const deadline = Date.now() + ms;
+  while (Date.now() < deadline) {
+    if (stopRequested) return "stop";
+    if (fetchRequested) {
+      fetchRequested = false;
+      return "fetch";
+    }
+    await sleep(Math.min(POLL_TICK_MS, deadline - Date.now()));
+  }
+  return "ok";
+}
 
 /** Run a command via pi.exec, optionally in cwd; returns trimmed stdout + exit code. */
 async function run(
@@ -171,7 +197,20 @@ let turnResolve: (() => void) | null = null;
 
 function driveAgent(pi: ExtensionAPI, prompt: string): Promise<void> {
   return new Promise((resolve) => {
-    turnResolve = resolve;
+    let done = false;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      clearInterval(timer);
+      turnResolve = null;
+      resolve();
+    };
+    turnResolve = finish;
+    // Also resolve early if /loop stop fires mid-turn (loop exits at the next
+    // boundary; the in-flight agent turn runs to its own end).
+    const timer = setInterval(() => {
+      if (stopRequested) finish();
+    }, POLL_TICK_MS);
     pi.sendUserMessage(prompt);
   });
 }
@@ -246,7 +285,9 @@ async function awaitCodexReview(
   // Poll every REVIEW_WAIT_MS; retry on empty until REVIEW_TOTAL_TIMEOUT_MS.
   const deadline = Date.now() + REVIEW_TOTAL_TIMEOUT_MS;
   while (Date.now() < deadline) {
-    await sleep(REVIEW_WAIT_MS);
+    const wake = await sleepPoll(REVIEW_WAIT_MS);
+    if (wake === "stop") return { pass: false, timeout: false, stopped: true, suggestions: [] };
+    // wake === "fetch" (flag consumed) or "ok" → fall through and fetch now.
 
     const comments = (await ghJson<GhComment[]>(
       pi,
@@ -254,7 +295,7 @@ async function awaitCodexReview(
     )) ?? [];
     const freshComments = comments.filter((c) => isCodex(c.user?.login) && c.created_at > since);
     if (freshComments.some((c) => PASS_RE.test(c.body))) {
-      return { pass: true, timeout: false, suggestions: [] };
+      return { pass: true, timeout: false, stopped: false, suggestions: [] };
     }
 
     const reviews = (await ghJson<GhReview[]>(
@@ -273,7 +314,7 @@ async function awaitCodexReview(
         .filter((c) => isCodex(c.user?.login) && c.created_at > since)
         .map(parseSuggestion)
         .filter((s) => s.title);
-      return { pass: false, timeout: false, suggestions };
+      return { pass: false, timeout: false, stopped: false, suggestions };
     }
 
     // Nothing yet — retry after another interval (unless the cap is reached).
@@ -284,7 +325,7 @@ async function awaitCodexReview(
       );
     }
   }
-  return { pass: false, timeout: true, suggestions: [] };
+  return { pass: false, timeout: true, stopped: false, suggestions: [] };
 }
 
 // --- agent-driven phases (each scoped to the change's worktree) ----------------
@@ -343,6 +384,35 @@ async function fixPhase(
   await driveAgent(pi, prompt);
 }
 
+let loopActive = false; // true while a /loop run (runTask) is in flight — read by the input handler
+
+/** Precondition checks shared by the normal run and /loop resume. */
+async function checkPreconditions(pi: ExtensionAPI, ctx: any): Promise<boolean> {
+  for (const cmd of ["git", "gh", "openspec"]) {
+    const { code } = await run(pi, "sh", ["-c", `command -v ${cmd}`]);
+    if (code !== 0) {
+      ctx.ui.notify(`dev-loop: required command missing: ${cmd}`, "error");
+      return false;
+    }
+  }
+  const { code: osDir } = await run(pi, "sh", ["-c", `test -d openspec`]);
+  if (osDir !== 0) {
+    ctx.ui.notify("dev-loop: no openspec/ dir — run `/loop init` first", "error");
+    return false;
+  }
+  return true;
+}
+
+/** Wraps runTask to toggle loopActive (read by the input handler). */
+async function runTaskGuarded(pi: ExtensionAPI, ctx: any, change: string, dryRun: boolean): Promise<boolean> {
+  loopActive = true;
+  try {
+    return await runTask(pi, ctx, change, dryRun);
+  } finally {
+    loopActive = false;
+  }
+}
+
 // --- per-change pipeline -------------------------------------------------------
 async function runTask(
   pi: ExtensionAPI,
@@ -354,6 +424,10 @@ async function runTask(
   const wtDir = join(repoRoot, WORKTREE_ROOT, change);
 
   ctx.ui.notify(`dev-loop: change → ${change} (worktree ${wtDir})`, "info");
+
+  // Fresh run: clear any stale control flags left by a previous /loop stop.
+  stopRequested = false;
+  fetchRequested = false;
 
   await ensureLocalIgnore(pi, repoRoot, `${WORKTREE_ROOT}/`);
 
@@ -428,6 +502,11 @@ async function runTask(
     ctx.ui.notify(`dev-loop: resuming — PR #${prNum} already open`, "info");
   } else {
     await buildPhase(pi, ctx, change, wtDir, false);
+    if (stopRequested) {
+      interruptedChange = change;
+      ctx.ui.notify(`dev-loop: stopped during build — worktree left; use /loop resume`, "warning");
+      return false;
+    }
     // buildPhase must have opened a PR (also catches the agent working outside
     // the worktree — no push of <change> ⇒ no PR).
     const after = await prStateFor(pi, repo, change);
@@ -456,6 +535,11 @@ async function runTask(
     );
     const result = await awaitCodexReview(pi, ctx, repo, prNum, since);
 
+    if (result.stopped) {
+      interruptedChange = change;
+      ctx.ui.notify(`dev-loop: stopped by /loop stop — PR + worktree left; use /loop resume`, "warning");
+      return false;
+    }
     if (result.pass) {
       ctx.ui.notify(`dev-loop: Codex passed on round ${round}`, "info");
       break;
@@ -485,6 +569,11 @@ async function runTask(
 
     const { stdout: headPre } = await run(pi, "git", ["rev-parse", "HEAD"], wtDir);
     await fixPhase(pi, ctx, change, wtDir, prNum, round, result.suggestions);
+    if (stopRequested) {
+      interruptedChange = change;
+      ctx.ui.notify(`dev-loop: stopped during fix round ${round} — PR + worktree left; use /loop resume`, "warning");
+      return false;
+    }
     const { stdout: headPost } = await run(pi, "git", ["rev-parse", "HEAD"], wtDir);
     if (headPre === headPost) {
       ctx.ui.notify(`dev-loop: agent made no progress on round ${round}; stopping (PR + worktree left)`, "warning");
@@ -567,36 +656,68 @@ export default function (pi: ExtensionAPI) {
     r && r();
   });
 
+  // While a /loop run is in flight, free-text submits don't help (only
+  // /loop stop|fetch|resume do). Slash commands bypass this event, so they still
+  // work; this just reminds the user + consumes stray free-text that would
+  // otherwise cut the loop's agent turn short. The loop's own sendUserMessage
+  // calls have source "extension" and pass through unchanged.
+  pi.on("input", async (event, ctx) => {
+    if (loopActive && event.source === "interactive") {
+      ctx.ui.notify("dev-loop is running — use /loop stop | /loop fetch | /loop resume (free-text is ignored)", "info");
+      return { action: "handled" };
+    }
+    return { action: "continue" };
+  });
+
   pi.registerCommand("loop", {
     description:
-      "Autonomous OpenSpec-change → worktree → PR → Codex review → archive → merge loop. Flags: --dry-run --all",
+      "Autonomous OpenSpec-change → worktree → PR → Codex review → archive → merge loop. Subcommands: stop | fetch | resume. Flags: --dry-run --all",
     handler: async (args, ctx) => {
       const argv = String(args ?? "").trim();
       const tokens = argv.split(/\s+/).filter(Boolean);
-      if (tokens[0] === "init") {
+      const sub = tokens[0];
+
+      if (sub === "init") {
         await initProject(pi, ctx);
         return;
       }
+
+      // Control subcommands — run concurrently with an in-flight /loop; they
+      // just flip module-level flags the loop reads at its checkpoints. Slash
+      // commands bypass the input event, so these always reach the handler.
+      if (sub === "stop") {
+        if (!loopActive) { ctx.ui.notify("dev-loop: no /loop is running", "warning"); return; }
+        stopRequested = true;
+        ctx.ui.notify("dev-loop: stop requested — will stop after the current step (PR + worktree kept)", "warning");
+        return;
+      }
+      if (sub === "fetch") {
+        if (!loopActive) { ctx.ui.notify("dev-loop: no /loop is running", "warning"); return; }
+        fetchRequested = true;
+        ctx.ui.notify("dev-loop: fetch requested — will re-poll Codex review now", "info");
+        return;
+      }
+      if (sub === "resume") {
+        if (!interruptedChange) {
+          ctx.ui.notify("dev-loop: nothing to resume (no change stopped via /loop stop)", "warning");
+          return;
+        }
+        if (!(await checkPreconditions(pi, ctx))) return;
+        const ch = interruptedChange;
+        ctx.ui.notify(`dev-loop: resuming "${ch}"`, "info");
+        const merged = await runTaskGuarded(pi, ctx, ch, false);
+        if (merged) ctx.ui.notify(`dev-loop: "${ch}" merged ✅`, "info");
+        return;
+      }
+
+      // Normal run: /loop [change] [--dry-run] [--all].
       const dryRun = tokens.includes("--dry-run");
       const all = tokens.includes("--all");
       const positional = tokens.filter((t) => !t.startsWith("--"));
       const oneOff = positional.join(" ").trim(); // a change name, run directly
-
       const cwd = ctx.cwd as string;
 
-      // Preconditions.
-      for (const cmd of ["git", "gh", "openspec"]) {
-        const { code } = await run(pi, "sh", ["-c", `command -v ${cmd}`]);
-        if (code !== 0) {
-          ctx.ui.notify(`dev-loop: required command missing: ${cmd}`, "error");
-          return;
-        }
-      }
-      const { code: osDir } = await run(pi, "sh", ["-c", `test -d openspec`]);
-      if (osDir !== 0) {
-        ctx.ui.notify("dev-loop: no openspec/ dir — run `/loop init` first", "error");
-        return;
-      }
+      if (!(await checkPreconditions(pi, ctx))) return;
 
       if (oneOff) {
         if (!existsSync(join(cwd, "openspec", "changes", oneOff))) {
@@ -622,7 +743,7 @@ export default function (pi: ExtensionAPI) {
           ctx.ui.notify("dev-loop: no more changes", "info");
           break;
         }
-        const merged = await runTask(pi, ctx, item.text, dryRun);
+        const merged = await runTaskGuarded(pi, ctx, item.text, dryRun);
         if (merged && item.lineNo) markDone(cwd, item.lineNo);
         if (oneOff) break;
         if (!all) {

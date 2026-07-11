@@ -54,7 +54,13 @@ Then `/reload` inside pi (or restart) to pick it up.
 /loop <change>         Run a specific change (added to TODO.md if absent, then run)
 /loop --dry-run        Build phase only; skip push / PR / review / archive / merge
 /loop --all            Keep pulling changes until TODO.md has none left
+
+/loop stop             Stop the running loop at the next safe boundary (PR + worktree kept)
+/loop fetch            Wake the Codex poll — re-fetch the review now instead of waiting ≤10min
+/loop resume           Resume the change last stopped via /loop stop
 ```
+
+The control subcommands (`stop` / `fetch` / `resume`) run concurrently with an in-flight `/loop` — they just flip module-level flags the loop reads at its checkpoints. They work because slash commands are dispatched before pi's `input` event, so a second `/loop stop` reaches its handler immediately even while the main loop is mid-poll.
 
 ### First-time setup (per project)
 
@@ -97,7 +103,7 @@ Net: change name = **what** (stable identifier); `TODO.md` = **in what order** (
 - **Resumable.** Re-running `/loop` (or `/loop <change>`) for an interrupted change picks up where it left off: it detects the existing worktree + PR state (none / open / merged) and the change's archived-ness, then skips completed stages and continues. A merged-but-uncleaned change just gets its worktree torn down and its TODO line marked.
 - **Keeps fixing until Codex passes.** Rounds are unbounded — it stays in the review→fix loop until Codex passes, **or** a stop fires: no Codex review after the wait (10 min), no agent progress in a round, or a **repeating review** (same issues reappearing ⇒ fixes flip-flopping).
 - **Merges automatically** once Codex passes (no confirmation) — archive → squash-merge → worktree teardown.
-- While `/loop` runs, don't type into pi manually — a stray message resolves the internal per-turn wait early. `Esc` aborts.
+- While `/loop` runs, free-text submits are consumed with a reminder — use the control subcommands instead (`/loop stop` / `/loop fetch` / `/loop resume`). Slash commands bypass the input event, so they always work; free-text during a run would otherwise spawn a stray agent turn that cuts the loop's turn short. `Esc` aborts the current agent turn but does **not** reach the loop's poll sleep (no agent turn is active while polling) — use `/loop stop` for a reliable stop.
 
 ## Architecture
 
