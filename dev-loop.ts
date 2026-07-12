@@ -29,6 +29,11 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 const CODEX_LOGIN = "chatgpt-codex-connector"; // bot login prefix; API may append "[bot]"
 const PASS_RE = /Didn't find any major issues/i;
+// Quota-exhausted: posted instead of a review when the account's code-review
+// budget is spent (resets on its own, usually within a day). Verified phrasings:
+//   "You have reached your Codex usage limits for code reviews."
+//   "Code review usage limits reached"
+const QUOTA_RE = /usage limits? for code reviews|code review usage limits? reached/i;
 const REVIEW_WAIT_MS = 10 * 60_000; // poll interval between Codex fetches
 const REVIEW_TOTAL_TIMEOUT_MS = 30 * 60_000; // cap per round (~3 intervals); raise to be more patient
 const WORKTREE_ROOT = ".worktree";
@@ -44,6 +49,7 @@ interface PollResult {
   pass: boolean;
   timeout: boolean;
   stopped: boolean;
+  quotaExhausted: boolean;
   suggestions: Suggestion[];
 }
 
@@ -286,7 +292,7 @@ async function awaitCodexReview(
   const deadline = Date.now() + REVIEW_TOTAL_TIMEOUT_MS;
   while (Date.now() < deadline) {
     const wake = await sleepPoll(REVIEW_WAIT_MS);
-    if (wake === "stop") return { pass: false, timeout: false, stopped: true, suggestions: [] };
+    if (wake === "stop") return { pass: false, timeout: false, stopped: true, quotaExhausted: false, suggestions: [] };
     // wake === "fetch" (flag consumed) or "ok" → fall through and fetch now.
 
     const comments = (await ghJson<GhComment[]>(
@@ -294,8 +300,11 @@ async function awaitCodexReview(
       `repos/${repo}/issues/${prNum}/comments`
     )) ?? [];
     const freshComments = comments.filter((c) => isCodex(c.user?.login) && c.created_at > since);
+    if (freshComments.some((c) => QUOTA_RE.test(c.body))) {
+      return { pass: false, timeout: false, stopped: false, quotaExhausted: true, suggestions: [] };
+    }
     if (freshComments.some((c) => PASS_RE.test(c.body))) {
-      return { pass: true, timeout: false, stopped: false, suggestions: [] };
+      return { pass: true, timeout: false, stopped: false, quotaExhausted: false, suggestions: [] };
     }
 
     const reviews = (await ghJson<GhReview[]>(
@@ -314,7 +323,7 @@ async function awaitCodexReview(
         .filter((c) => isCodex(c.user?.login) && c.created_at > since)
         .map(parseSuggestion)
         .filter((s) => s.title);
-      return { pass: false, timeout: false, stopped: false, suggestions };
+      return { pass: false, timeout: false, stopped: false, quotaExhausted: false, suggestions };
     }
 
     // Nothing yet — retry after another interval (unless the cap is reached).
@@ -325,7 +334,7 @@ async function awaitCodexReview(
       );
     }
   }
-  return { pass: false, timeout: true, stopped: false, suggestions: [] };
+  return { pass: false, timeout: true, stopped: false, quotaExhausted: false, suggestions: [] };
 }
 
 // --- agent-driven phases (each scoped to the change's worktree) ----------------
@@ -538,6 +547,14 @@ async function runTask(
     if (result.stopped) {
       interruptedChange = change;
       ctx.ui.notify(`dev-loop: stopped by /loop stop — PR + worktree left; use /loop resume`, "warning");
+      return false;
+    }
+    if (result.quotaExhausted) {
+      interruptedChange = change;
+      ctx.ui.notify(
+        `dev-loop: Codex review quota exhausted — stopping (PR + worktree left); use /loop resume after the quota resets`,
+        "warning"
+      );
       return false;
     }
     if (result.pass) {

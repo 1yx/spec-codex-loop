@@ -25,6 +25,7 @@ Bot login prefix: `chatgpt-codex-connector`.
 |---|---|---|---|
 | **Pass** | PR comment, body contains `Didn't find any major issues` | `gh api repos/:o/:r/issues/N/comments` | Done → merge |
 | **Fail** | review (`state: COMMENTED`) + inline comments | `gh api repos/:o/:r/pulls/N/comments` | Each inline comment fed to the agent as a fix task |
+| **Quota exhausted** | PR comment, body matches `usage limits? for code reviews` / `code review usage limits? reached` (e.g. "You have reached your Codex usage limits for code reviews.") | same comments endpoint | Stop → leave PR + worktree; `/loop resume` after the quota resets |
 | Pass (edge) | 👍 reaction on the trigger comment | reactions endpoint | Fallback (not observed in the reference PR) |
 
 Each inline comment is `![P1/P2/P3 Badge] … **<title>** <detail>`, with `path` / `line`. The extension parses severity + title + body + location and hands a formatted list to the agent. Inline comments are bound to a commit, so only the latest round's comments are used (stale ones are ignored).
@@ -101,7 +102,7 @@ Net: change name = **what** (stable identifier); `TODO.md` = **in what order** (
 - **Archive before merge.** Once Codex passes, `openspec archive <change>` folds the specs into `openspec/specs/` and moves the change to `archive/`, committed to the PR branch, then merged. (When `openspec/` came in via the whole-dir copy — untracked — archive output is untracked too; specs stay local, which is the point of keeping `openspec` out of `origin/main`.)
 - **Cleanup on success.** After `gh pr merge --squash --delete-branch`, the worktree is removed and its branch deleted. On any failure the PR **and** worktree are left for inspection.
 - **Resumable.** Re-running `/loop` (or `/loop <change>`) for an interrupted change picks up where it left off: it detects the existing worktree + PR state (none / open / merged) and the change's archived-ness, then skips completed stages and continues. A merged-but-uncleaned change just gets its worktree torn down and its TODO line marked.
-- **Keeps fixing until Codex passes.** Rounds are unbounded — it stays in the review→fix loop until Codex passes, **or** a stop fires: no Codex review after the wait (10 min), no agent progress in a round, or a **repeating review** (same issues reappearing ⇒ fixes flip-flopping).
+- **Keeps fixing until Codex passes.** Rounds are unbounded — it stays in the review→fix loop until Codex passes, **or** a stop fires: **Codex quota exhausted** (the bot posts "You have reached your Codex usage limits for code reviews." — stop, `/loop resume` after it resets), `/loop stop`, no Codex review after the wait (10 min), no agent progress in a round, or a **repeating review** (same issues reappearing ⇒ fixes flip-flopping).
 - **Merges automatically** once Codex passes (no confirmation) — archive → squash-merge → worktree teardown.
 - While `/loop` runs, free-text submits are consumed with a reminder — use the control subcommands instead (`/loop stop` / `/loop fetch` / `/loop resume`). Slash commands bypass the input event, so they always work; free-text during a run would otherwise spawn a stray agent turn that cuts the loop's turn short. `Esc` aborts the current agent turn but does **not** reach the loop's poll sleep (no agent turn is active while polling) — use `/loop stop` for a reliable stop.
 
