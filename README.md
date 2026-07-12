@@ -23,12 +23,18 @@ Bot login prefix: `chatgpt-codex-connector`.
 
 | Signal | Form | How it's read | Verdict |
 |---|---|---|---|
-| **Pass** | PR comment, body contains `Didn't find any major issues` | `gh api repos/:o/:r/issues/N/comments` | Done → merge |
-| **Fail** | review (`state: COMMENTED`) + inline comments | `gh api repos/:o/:r/pulls/N/comments` | Each inline comment fed to the agent as a fix task |
+| **Pass** | PR comment, body contains `Didn't find any major issues` + `Reviewed commit: \`<sha>\`` | `gh api repos/:o/:r/issues/N/comments` | Done → merge |
+| **Fail** | review (`state: COMMENTED`, `commit_id` = head) + inline comments | `gh api repos/:o/:r/pulls/N/reviews` + `…/pulls/N/comments` | Each inline comment fed to the agent as a fix task |
 | **Quota exhausted** | PR comment, body matches `usage limits? for code reviews` / `code review usage limits? reached` (e.g. "You have reached your Codex usage limits for code reviews.") | same comments endpoint | Stop → leave PR + worktree; `/loop resume` after the quota resets |
 | Pass (edge) | 👍 reaction on the trigger comment | reactions endpoint | Fallback (not observed in the reference PR) |
 
-Each inline comment is `![P1/P2/P3 Badge] … **<title>** <detail>`, with `path` / `line`. The extension parses severity + title + body + location and hands a formatted list to the agent. Inline comments are bound to a commit, so only the latest round's comments are used (stale ones are ignored).
+Each inline comment is `![P1/P2/P3 Badge] … **<title>** <detail>`, with `path` / `line`. The extension parses severity + title + body + location and hands a formatted list to the agent.
+
+**Verdicts are keyed on the HEAD commit, not on a wall-clock window.** Each round reads the worktree's `HEAD`, then looks for Codex's verdict on *that* commit: a pass comment whose `Reviewed commit:` matches `HEAD` → merge; a review whose `commit_id` matches `HEAD` → fix its inline comments; otherwise trigger `@codex review` and poll. So a stop mid-review or a `/loop resume` reuses a verdict Codex already gave instead of re-triggering and chasing a nondeterministic re-review. A pass takes precedence over a later fail review for the same commit.
+
+Inline comments are scoped to the head review by `pull_request_review_id`. The inline comments' own `commit_id` field is **not** usable for this: on a real PR it carried a third, unrelated SHA (neither the review's commit nor the PR head), so associating by it would select the wrong comments.
+
+Quota detection is gated on the trigger's own timestamp (read from GitHub, not the local clock): only a quota comment posted *after* the current round's `@codex review` counts, so a stale quota from before a resume can't fire and block progress indefinitely.
 
 ## Install
 
@@ -111,7 +117,7 @@ Net: change name = **what** (stable identifier); `TODO.md` = **in what order** (
 - `findTodoFile` / `pickTask` / `markDone` — case-insensitive `TODO.md` checkbox parse + flip (`node:fs`).
 - `ensureLocalIgnore` / `removeWorktree` / `prStateFor` — local gitignore, worktree/branch teardown, and PR-state (for resume) helpers.
 - `driveAgent` — sends a user message and resolves on the next `agent_end`; one shared listener, no accumulation.
-- `awaitCodexReview` — polls the bot's response to the current `@codex review` trigger every 10 min, retrying on empty up to 30 min.
+- `readCodexVerdict` / `pollCodexVerdict` — read Codex's verdict for the current HEAD commit (pass comment, fail review + inline comments, or quota); the loop reuses an existing verdict for the head before triggering, and polls every 10 min (≤30 min) only when it has to trigger.
 - `parseSuggestion` — strips `<sub>` / badge / bold markup → `{ severity, title, body, path, line }`.
 - `buildPhase` / `fixPhase` — agent-driven prompts scoped to the change's worktree (follow the `openspec-apply-change` skill; and address-review).
 - `runTask` — the per-change pipeline (worktree → build → review loop → archive → merge → teardown), **state-driven for resume**: detects the worktree + PR state (none / open / merged) + archived-ness and skips completed stages. `/loop` iterates it.

@@ -229,6 +229,7 @@ interface GhComment {
   body: string;
 }
 interface GhReview {
+  id?: number;
   user?: { login: string };
   state: string;
   submitted_at: string;
@@ -236,6 +237,7 @@ interface GhReview {
   body?: string;
 }
 interface GhInlineComment extends GhComment {
+  pull_request_review_id?: number;
   path?: string;
   line?: number | null;
   commit_id?: string;
@@ -281,58 +283,104 @@ function suggestionKey(suggestions: Suggestion[]): string {
     .join("\n");
 }
 
-async function awaitCodexReview(
+const shortSha = (sha: string) => sha.slice(0, 7);
+
+/** SHA of the commit a Codex pass comment reviewed, parsed from its body
+ *  (`**Reviewed commit:** \`<sha>\``). null if absent. */
+function passCommit(body: string): string | null {
+  return /Reviewed commit:\D{0,5}([0-9a-f]{7,40})/i.exec(body)?.[1] ?? null;
+}
+
+/** created_at of the newest issue comment on the PR — used to timestamp a
+ *  just-posted `@codex review` trigger so quota detection can be gated on
+ *  freshness (GitHub's clock, not local). */
+async function latestCommentAt(pi: ExtensionAPI, repo: string, prNum: number): Promise<string> {
+  const comments =
+    (await ghJson<GhComment[]>(pi, `repos/${repo}/issues/${prNum}/comments?per_page=100`)) ?? [];
+  return comments[comments.length - 1]?.created_at ?? "";
+}
+
+/** Codex's verdict for `head`, or null if Codex hasn't reviewed this commit.
+ *  Verdicts are keyed on the commit SHA, not wall-clock, so a stop/resume can't
+ *  hide a verdict Codex already gave:
+ *  - pass: a pass issue-comment whose "Reviewed commit" is this head.
+ *  - fail: a Codex review on this head → its inline comments, scoped by review id
+ *    (the inline comments' own commit_id is unreliable — on a real PR it carried a
+ *    third unrelated SHA, so it cannot be used to associate comments).
+ *  - quota: only when `triggerAt` is set and a quota comment landed after it, so a
+ *    stale quota from before this trigger (e.g. across a resume) can't fire.
+ *  Pass takes precedence over a later fail review for the same commit — Codex is
+ *  nondeterministic, so re-reviewing an already-passed commit is noise. */
+async function readCodexVerdict(
+  pi: ExtensionAPI,
+  repo: string,
+  prNum: number,
+  head: string,
+  triggerAt: string | null
+): Promise<PollResult | null> {
+  const head7 = shortSha(head);
+  const issueComments =
+    (await ghJson<GhComment[]>(pi, `repos/${repo}/issues/${prNum}/comments?per_page=100`)) ?? [];
+  const codexIssue = issueComments.filter((c) => isCodex(c.user?.login));
+
+  if (
+    codexIssue.some((c) => PASS_RE.test(c.body) && shortSha(passCommit(c.body) ?? "") === head7)
+  ) {
+    return { pass: true, timeout: false, stopped: false, quotaExhausted: false, suggestions: [] };
+  }
+  if (triggerAt && codexIssue.some((c) => QUOTA_RE.test(c.body) && c.created_at > triggerAt)) {
+    return { pass: false, timeout: false, stopped: false, quotaExhausted: true, suggestions: [] };
+  }
+
+  const reviews =
+    (await ghJson<GhReview[]>(pi, `repos/${repo}/pulls/${prNum}/reviews?per_page=100`)) ?? [];
+  const headReviewIds = new Set(
+    reviews
+      .filter(
+        (r) => isCodex(r.user?.login) && shortSha(r.commit_id ?? "") === head7 && r.id != null
+      )
+      .map((r) => r.id as number)
+  );
+  if (headReviewIds.size > 0) {
+    const inline =
+      (await ghJson<GhInlineComment[]>(pi, `repos/${repo}/pulls/${prNum}/comments?per_page=100`)) ??
+      [];
+    const suggestions = inline
+      .filter(
+        (c) =>
+          isCodex(c.user?.login) &&
+          c.pull_request_review_id != null &&
+          headReviewIds.has(c.pull_request_review_id)
+      )
+      .map(parseSuggestion)
+      .filter((s) => s.title);
+    return { pass: false, timeout: false, stopped: false, quotaExhausted: false, suggestions };
+  }
+  return null;
+}
+
+/** Poll readCodexVerdict every REVIEW_WAIT_MS until a verdict lands or the cap hits. */
+async function pollCodexVerdict(
   pi: ExtensionAPI,
   ctx: any,
   repo: string,
   prNum: number,
-  since: string
+  head: string,
+  triggerAt: string
 ): Promise<PollResult> {
-  // Poll every REVIEW_WAIT_MS; retry on empty until REVIEW_TOTAL_TIMEOUT_MS.
   const deadline = Date.now() + REVIEW_TOTAL_TIMEOUT_MS;
   while (Date.now() < deadline) {
     const wake = await sleepPoll(REVIEW_WAIT_MS);
-    if (wake === "stop") return { pass: false, timeout: false, stopped: true, quotaExhausted: false, suggestions: [] };
-    // wake === "fetch" (flag consumed) or "ok" → fall through and fetch now.
-
-    const comments = (await ghJson<GhComment[]>(
-      pi,
-      `repos/${repo}/issues/${prNum}/comments`
-    )) ?? [];
-    const freshComments = comments.filter((c) => isCodex(c.user?.login) && c.created_at > since);
-    if (freshComments.some((c) => QUOTA_RE.test(c.body))) {
-      return { pass: false, timeout: false, stopped: false, quotaExhausted: true, suggestions: [] };
+    if (wake === "stop") {
+      return { pass: false, timeout: false, stopped: true, quotaExhausted: false, suggestions: [] };
     }
-    if (freshComments.some((c) => PASS_RE.test(c.body))) {
-      return { pass: true, timeout: false, stopped: false, quotaExhausted: false, suggestions: [] };
-    }
-
-    const reviews = (await ghJson<GhReview[]>(
-      pi,
-      `repos/${repo}/pulls/${prNum}/reviews`
-    )) ?? [];
-    const failReview = reviews.find(
-      (r) => isCodex(r.user?.login) && r.submitted_at > since
+    // wake === "fetch" (flag consumed) or "ok" → poll now.
+    const v = await readCodexVerdict(pi, repo, prNum, head, triggerAt);
+    if (v) return v;
+    ctx.ui.notify(
+      `dev-loop: no Codex verdict for ${shortSha(head)} yet; retrying in ${REVIEW_WAIT_MS / 60000}min…`,
+      "info"
     );
-    if (failReview) {
-      const inline = (await ghJson<GhInlineComment[]>(
-        pi,
-        `repos/${repo}/pulls/${prNum}/comments`
-      )) ?? [];
-      const suggestions = inline
-        .filter((c) => isCodex(c.user?.login) && c.created_at > since)
-        .map(parseSuggestion)
-        .filter((s) => s.title);
-      return { pass: false, timeout: false, stopped: false, quotaExhausted: false, suggestions };
-    }
-
-    // Nothing yet — retry after another interval (unless the cap is reached).
-    if (Date.now() < deadline) {
-      ctx.ui.notify(
-        `dev-loop: no Codex review yet; retrying in ${REVIEW_WAIT_MS / 60000}min…`,
-        "info"
-      );
-    }
   }
   return { pass: false, timeout: true, stopped: false, quotaExhausted: false, suggestions: [] };
 }
@@ -528,21 +576,35 @@ async function runTask(
   ctx.ui.notify(`dev-loop: PR #${prNum} — starting Codex review loop`, "info");
 
   // Review loop — keeps fixing until Codex passes; git ops target the worktree.
+  // Verdicts are keyed on the HEAD commit, not wall-clock: a pass/fail review
+  // already on the current head is reused instead of re-triggering, so a stop
+  // mid-review or a resume can't blind the loop to a verdict Codex already gave.
   const seenSignatures: string[] = [];
   for (let round = 1; ; round++) {
-    const since = new Date().toISOString();
-    const { code: trigCode, stderr: trigErr } = await run(pi, "gh", [
-      "pr", "comment", String(prNum), "--body", "@codex review", "--repo", repo,
-    ]);
-    if (trigCode !== 0) {
-      ctx.ui.notify(`dev-loop: trigger @codex review failed: ${trigErr}`, "error");
-      return false;
+    const head = (await run(pi, "git", ["rev-parse", "HEAD"], wtDir)).stdout;
+    let result = await readCodexVerdict(pi, repo, prNum, head, null);
+    if (!result) {
+      const { code: trigCode, stderr: trigErr } = await run(pi, "gh", [
+        "pr", "comment", String(prNum), "--body", "@codex review", "--repo", repo,
+      ]);
+      if (trigCode !== 0) {
+        ctx.ui.notify(`dev-loop: trigger @codex review failed: ${trigErr}`, "error");
+        return false;
+      }
+      // Gate quota on this trigger's timestamp so a stale quota comment (e.g. from
+      // before a resume) can't fire; only a fresh quota response stops the loop.
+      const triggerAt = await latestCommentAt(pi, repo, prNum);
+      ctx.ui.notify(
+        `dev-loop: round ${round} on ${shortSha(head)} — polling Codex every ${REVIEW_WAIT_MS / 60000}min (≤${REVIEW_TOTAL_TIMEOUT_MS / 60000}min)…`,
+        "info"
+      );
+      result = await pollCodexVerdict(pi, ctx, repo, prNum, head, triggerAt);
+    } else {
+      ctx.ui.notify(
+        `dev-loop: round ${round} on ${shortSha(head)} — reusing existing Codex verdict`,
+        "info"
+      );
     }
-    ctx.ui.notify(
-      `dev-loop: round ${round} — polling Codex every ${REVIEW_WAIT_MS / 60000}min (≤${REVIEW_TOTAL_TIMEOUT_MS / 60000}min)…`,
-      "info"
-    );
-    const result = await awaitCodexReview(pi, ctx, repo, prNum, since);
 
     if (result.stopped) {
       interruptedChange = change;
