@@ -370,17 +370,19 @@ async function pollCodexVerdict(
 ): Promise<PollResult> {
   const deadline = Date.now() + REVIEW_TOTAL_TIMEOUT_MS;
   while (Date.now() < deadline) {
-    const wake = await sleepPoll(REVIEW_WAIT_MS);
-    if (wake === "stop") {
-      return { pass: false, timeout: false, stopped: true, quotaExhausted: false, suggestions: [] };
-    }
-    // wake === "fetch" (flag consumed) or "ok" → poll now.
+    // Check before sleeping: a verdict may already be on the PR — Codex may have
+    // finished while the loop was stopped, or replied quickly after the trigger.
     const v = await readCodexVerdict(pi, repo, prNum, head, triggerAt);
     if (v) return v;
     ctx.ui.notify(
       `dev-loop: no Codex verdict for ${shortSha(head)} yet; retrying in ${REVIEW_WAIT_MS / 60000}min…`,
       "info"
     );
+    const wake = await sleepPoll(REVIEW_WAIT_MS);
+    if (wake === "stop") {
+      return { pass: false, timeout: false, stopped: true, quotaExhausted: false, suggestions: [] };
+    }
+    // wake === "fetch" (flag consumed) or "ok" → loop and re-check now.
   }
   return { pass: false, timeout: true, stopped: false, quotaExhausted: false, suggestions: [] };
 }
