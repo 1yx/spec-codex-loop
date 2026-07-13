@@ -581,21 +581,40 @@ async function runTask(
   // mid-review or a resume can't blind the loop to a verdict Codex already gave.
   const seenSignatures: string[] = [];
   for (let round = 1; ; round++) {
-    // Detect an external push/merge to origin/<change> (e.g. GitHub's "Update
-    // branch" button, a collaborator, a CI bot) before trusting local HEAD for
-    // verdict matching and for the fast-forward push below. Any divergence would
-    // silently break both — readCodexVerdict keys on local HEAD, and `git push`
-    // would be non-fast-forward — so stop and let the human resolve it.
+    // Reconcile local HEAD with origin/<change> before trusting it for verdict
+    // matching (readCodexVerdict keys on local HEAD) and for the fast-forward
+    // push below. "local ≠ origin" splits into two opposite cases:
+    //   - local ahead (a manual commit, or a push that failed silently last
+    //     round): fast-forward push to self-heal, then proceed.
+    //   - origin ahead or diverged (GitHub "Update branch", a collaborator, a
+    //     CI bot): stop for a human — the push would be non-fast-forward and the
+    //     review would land on the wrong head.
     await run(pi, "git", ["fetch", "origin", change], wtDir);
     const { stdout: localHead } = await run(pi, "git", ["rev-parse", "HEAD"], wtDir);
     const { stdout: remoteHead } = await run(pi, "git", ["rev-parse", `origin/${change}`], wtDir);
     if (remoteHead && localHead && remoteHead !== localHead) {
-      interruptedChange = change;
-      ctx.ui.notify(
-        `dev-loop: local ${shortSha(localHead)} ≠ origin/${change} ${shortSha(remoteHead)} (external push/merge detected, e.g. "Update branch"); stopping — resolve divergence then /loop resume`,
-        "error",
+      // exit 0 => remoteHead is an ancestor of localHead => local is ahead (FF).
+      const { code: ffCode } = await run(
+        pi, "git", ["merge-base", "--is-ancestor", remoteHead, localHead], wtDir,
       );
-      return false;
+      if (ffCode === 0) {
+        const { code: syncCode, stderr: syncErr } = await run(pi, "git", ["push"], wtDir);
+        if (syncCode !== 0) {
+          interruptedChange = change;
+          ctx.ui.notify(
+            `dev-loop: sync push failed (${syncErr}); stopping (PR + worktree left) — fix then /loop resume`,
+            "error",
+          );
+          return false;
+        }
+      } else {
+        interruptedChange = change;
+        ctx.ui.notify(
+          `dev-loop: origin/${change} ${shortSha(remoteHead)} is ahead of / diverged from local ${shortSha(localHead)} (external push/merge, e.g. "Update branch"); stopping — resolve then /loop resume`,
+          "error",
+        );
+        return false;
+      }
     }
     const head = localHead;
     let result = await readCodexVerdict(pi, repo, prNum, head, null);
