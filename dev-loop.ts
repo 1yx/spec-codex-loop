@@ -581,7 +581,23 @@ async function runTask(
   // mid-review or a resume can't blind the loop to a verdict Codex already gave.
   const seenSignatures: string[] = [];
   for (let round = 1; ; round++) {
-    const head = (await run(pi, "git", ["rev-parse", "HEAD"], wtDir)).stdout;
+    // Detect an external push/merge to origin/<change> (e.g. GitHub's "Update
+    // branch" button, a collaborator, a CI bot) before trusting local HEAD for
+    // verdict matching and for the fast-forward push below. Any divergence would
+    // silently break both — readCodexVerdict keys on local HEAD, and `git push`
+    // would be non-fast-forward — so stop and let the human resolve it.
+    await run(pi, "git", ["fetch", "origin", change], wtDir);
+    const { stdout: localHead } = await run(pi, "git", ["rev-parse", "HEAD"], wtDir);
+    const { stdout: remoteHead } = await run(pi, "git", ["rev-parse", `origin/${change}`], wtDir);
+    if (remoteHead && localHead && remoteHead !== localHead) {
+      interruptedChange = change;
+      ctx.ui.notify(
+        `dev-loop: local ${shortSha(localHead)} ≠ origin/${change} ${shortSha(remoteHead)} (external push/merge detected, e.g. "Update branch"); stopping — resolve divergence then /loop resume`,
+        "error",
+      );
+      return false;
+    }
+    const head = localHead;
     let result = await readCodexVerdict(pi, repo, prNum, head, null);
     if (!result) {
       const { code: trigCode, stderr: trigErr } = await run(pi, "gh", [
@@ -658,7 +674,19 @@ async function runTask(
       ctx.ui.notify(`dev-loop: agent made no progress on round ${round}; stopping (PR + worktree left)`, "warning");
       return false;
     }
-    await run(pi, "git", ["push"], wtDir);
+    // A failed push (non-fast-forward from an external advance, network, auth)
+    // used to be swallowed silently — the loop kept committing locally while the
+    // PR never advanced. Treat any push failure as terminal so the divergence
+    // surfaces instead of rotting for N rounds.
+    const { code: pushCode, stderr: pushErr } = await run(pi, "git", ["push"], wtDir);
+    if (pushCode !== 0) {
+      interruptedChange = change;
+      ctx.ui.notify(
+        `dev-loop: git push failed on round ${round} (${pushErr}); stopping (PR + worktree left) — fix then /loop resume`,
+        "error",
+      );
+      return false;
+    }
   }
 
   // Archive the change (fold specs into openspec/specs, move to archive/). Idempotent on resume.
@@ -672,7 +700,15 @@ async function runTask(
     if (dirty) {
       await run(pi, "git", ["add", "-A"], wtDir);
       await run(pi, "git", ["commit", "-m", `chore: archive ${change}`], wtDir);
-      await run(pi, "git", ["push"], wtDir);
+      const { code: arcPushCode, stderr: arcPushErr } = await run(pi, "git", ["push"], wtDir);
+      if (arcPushCode !== 0) {
+        interruptedChange = change;
+        ctx.ui.notify(
+          `dev-loop: git push of archive commit failed (${arcPushErr}); stopping (PR + worktree left) — fix then /loop resume`,
+          "error",
+        );
+        return false;
+      }
     }
   }
 
