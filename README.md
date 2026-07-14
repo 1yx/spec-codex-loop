@@ -63,11 +63,31 @@ Then `/reload` inside pi (or restart) to pick it up.
 /loop --all            Keep pulling changes until TODO.md has none left
 
 /loop stop             Stop the running loop at the next safe boundary (PR + worktree kept)
-/loop fetch            Wake the Codex poll — re-fetch the review now instead of waiting ≤10min
+/loop fetch            Re-fetch the Codex review now instead of waiting ≤10min
 /loop resume           Resume the change last stopped via /loop stop
 ```
 
-The control subcommands (`stop` / `fetch` / `resume`) run concurrently with an in-flight `/loop` — they just flip module-level flags the loop reads at its checkpoints. They work because slash commands are dispatched before pi's `input` event, so a second `/loop stop` reaches its handler immediately even while the main loop is mid-poll.
+`/loop resume` re-enters the loop driver for the change last stopped via `/loop stop`. `/loop stop` and `/loop fetch` work in real time even while a `/loop` is running (see "Control during a run").
+
+### Control during a run
+
+`/loop stop` and `/loop fetch` work in real time while a `/loop` is running. The loop is a **re-entrant state machine**, not a blocking handler: the `/loop` command returns as soon as it reaches `review_wait` (the only long wait), after persisting its phase/inner-state to `.worktree/<change>/.loop-state.json` and scheduling a `setTimeout` to re-probe in 10 min. pi is then back at its prompt, so the next `/loop fetch` or `/loop stop` dispatches immediately and the loop reacts within ~1 s at its next step boundary.
+
+```bash
+/loop fetch            # re-check Codex now (skip the ≤10-min wait)
+/loop stop             # stop at the next safe boundary (PR + worktree kept)
+```
+
+From **another terminal** (a different shell, SSH — anywhere you can't run a pi slash command), the same signals work via sentinel files polled once per second:
+
+```bash
+touch .dev-loop-fetch  # same as /loop fetch
+touch .dev-loop-stop   # same as /loop stop
+```
+
+The loop unlinks each sentinel as it consumes it, and clears stale ones at the start of every run. `Esc` aborts the current agent turn (build/fix) but does **not** reach the `review_wait` timer — use `/loop stop` for a reliable stop.
+
+> **Why this design.** pi serializes command dispatch behind a running command handler. An earlier version held the `/loop` handler open across the 10-min poll (`await sleep`), so every later input — including `/loop fetch` — queued until the loop finished. Splitting review into a persisted state machine that yields the handler at each wait is what makes live control possible.
 
 ### First-time setup (per project)
 
@@ -110,17 +130,18 @@ Net: change name = **what** (stable identifier); `TODO.md` = **in what order** (
 - **Resumable.** Re-running `/loop` (or `/loop <change>`) for an interrupted change picks up where it left off: it detects the existing worktree + PR state (none / open / merged) and the change's archived-ness, then skips completed stages and continues. A merged-but-uncleaned change just gets its worktree torn down and its TODO line marked.
 - **Keeps fixing until Codex passes.** Rounds are unbounded — it stays in the review→fix loop until Codex passes, **or** a stop fires: **Codex quota exhausted** (the bot posts "You have reached your Codex usage limits for code reviews." — stop, `/loop resume` after it resets), `/loop stop`, no Codex review after the wait (10 min), no agent progress in a round, or a **repeating review** (same issues reappearing ⇒ fixes flip-flopping).
 - **Merges automatically** once Codex passes (no confirmation) — archive → squash-merge → worktree teardown.
-- While `/loop` runs, free-text submits are consumed with a reminder — use the control subcommands instead (`/loop stop` / `/loop fetch` / `/loop resume`). Slash commands bypass the input event, so they always work; free-text during a run would otherwise spawn a stray agent turn that cuts the loop's turn short. `Esc` aborts the current agent turn but does **not** reach the loop's poll sleep (no agent turn is active while polling) — use `/loop stop` for a reliable stop.
+- While `/loop` runs, `/loop stop` / `/loop fetch` reach the loop in real time — the handler returns during each `review_wait`, so pi is back at its prompt (see "Control during a run"). Free-text submits are consumed with a reminder. `Esc` aborts the current agent turn (build/fix) but does **not** reach the `review_wait` timer; use `/loop stop` (or `touch .dev-loop-stop`) for a reliable stop.
 
 ## Architecture
 
 - `findTodoFile` / `pickTask` / `markDone` — case-insensitive `TODO.md` checkbox parse + flip (`node:fs`).
 - `ensureLocalIgnore` / `removeWorktree` / `prStateFor` — local gitignore, worktree/branch teardown, and PR-state (for resume) helpers.
 - `driveAgent` — sends a user message and resolves on the next `agent_end`; one shared listener, no accumulation.
-- `readCodexVerdict` / `pollCodexVerdict` — read Codex's verdict for the current HEAD commit (pass comment, fail review + inline comments, or quota); the loop reuses an existing verdict for the head before triggering, and polls every 10 min (≤30 min) only when it has to trigger.
+- `readCodexVerdict` — reads Codex's verdict for the current HEAD commit (pass comment, fail review + inline comments, or quota); the loop reuses an existing verdict for the head before triggering.
 - `parseSuggestion` — strips `<sub>` / badge / bold markup → `{ severity, title, body, path, line }`.
 - `buildPhase` / `fixPhase` — agent-driven prompts scoped to the change's worktree (follow the `openspec-apply-change` skill; and address-review).
-- `runTask` — the per-change pipeline (worktree → build → review loop → archive → merge → teardown), **state-driven for resume**: detects the worktree + PR state (none / open / merged) + archived-ness and skips completed stages. `/loop` iterates it.
+- `lifecycle-state.ts` — pure outer phase model (`PHASE` + `REVIEW_INNER` + transition graph + `resolvePhase`); no I/O, fully unit-tested.
+- `runPrefix` / `oneStep` / `driveChange` / `runLoopChain` — the re-entrant driver. `runPrefix` does resolve→provision→build; `oneStep` runs one transition of the review inner machine (reconcile→probe→trigger→**wait**→fix) or the archive/merge/cleanup suffix; `runLoopChain` is the single re-entry point (the handler, the `review_wait` timer, and `/loop fetch` all call it) that walks steps (setImmediate yield between them), chains `--all`, and owns `loopActive` + the wait-timer + sentinel-ticker lifecycle. State persists to `.worktree/<change>/.loop-state.json`, so any stop / resume / crash re-enters at the exact phase.
 
 ## Not included (add when needed)
 

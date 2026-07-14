@@ -23,9 +23,10 @@
  * address review) is delegated to pi's agent, one bounded turn at a time, each
  * told to work inside the change's worktree.
  */
-import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { PHASE, REVIEW_INNER } from "./lifecycle-state.ts";
 
 const CODEX_LOGIN = "chatgpt-codex-connector"; // bot login prefix; API may append "[bot]"
 const PASS_RE = /Didn't find any major issues/i;
@@ -37,6 +38,12 @@ const QUOTA_RE = /usage limits? for code reviews|code review usage limits? reach
 const REVIEW_WAIT_MS = 10 * 60_000; // poll interval between Codex fetches
 const REVIEW_TOTAL_TIMEOUT_MS = 30 * 60_000; // cap per round (~3 intervals); raise to be more patient
 const WORKTREE_ROOT = ".worktree";
+// Control sentinels (created at repo root) — the cross-terminal control path.
+// /loop fetch|stop now reach the loop in real time via the non-blocking driver,
+// but only inside the pi session; a 1s sentinel ticker (startSentinelTicker)
+// lets `touch` from ANY terminal (another shell, SSH) do the same.
+const FETCH_SENTINEL = ".dev-loop-fetch";
+const STOP_SENTINEL = ".dev-loop-stop";
 
 interface Suggestion {
   severity: string | null;
@@ -65,19 +72,105 @@ let fetchRequested = false;
 let interruptedChange: string | null = null;
 const POLL_TICK_MS = 1000;
 
-/** Like sleep(), but wakes every POLL_TICK_MS to check stop/fetch flags.
- *  Returns "stop" / "fetch" if the flag fired (fetch flag is consumed), else "ok". */
-async function sleepPoll(ms: number): Promise<"ok" | "fetch" | "stop"> {
-  const deadline = Date.now() + ms;
-  while (Date.now() < deadline) {
-    if (stopRequested) return "stop";
-    if (fetchRequested) {
-      fetchRequested = false;
-      return "fetch";
-    }
-    await sleep(Math.min(POLL_TICK_MS, deadline - Date.now()));
-  }
-  return "ok";
+/** Apply a control signal (fetch/stop). Sets the flag the chain checks, and —
+ *  if a loop is running — cancels the review_wait timer and (for fetch) re-enters
+ *  the chain immediately. With the non-blocking driver, /loop fetch|stop reach
+ *  here in real time (no command-dispatch queue), so this is the live control
+ *  path; sentinel files route through it too for cross-terminal use. */
+function applyControl(ctx: any, kind: "fetch" | "stop") {
+  if (kind === "fetch") fetchRequested = true; else stopRequested = true;
+  ctx.ui.notify(
+    kind === "stop" ? "dev-loop: stop requested — next safe boundary" : "dev-loop: fetch requested — rechecking now",
+    kind === "stop" ? "warning" : "info",
+  );
+  if (!runCtx) return;
+  clearWaitTimer(runCtx.change);
+  if (kind === "fetch" && !stepping) void runLoopChain();
+}
+
+/** Command path: write the sentinel (cross-terminal trigger) then apply. */
+function writeControl(ctx: any, sentinel: string, kind: "fetch" | "stop") {
+  try { writeFileSync(join(ctx.cwd as string, sentinel), ""); } catch { /* non-fatal */ }
+  applyControl(ctx, kind);
+}
+
+// --- re-entrant loop state machine (review de-block) --------------------------
+// pi serializes command dispatch behind a running /loop handler, so the review
+// poll can't `await sleep` inside the handler. Instead the loop persists its
+// phase/inner-state to .worktree/<change>/.loop-state.json, runs ONE transition
+// per chain step, and on review_wait schedules a setTimeout + returns. The
+// timer, /loop fetch, or /loop resume re-enter runLoopChain, which walks steps
+// (yielding via setImmediate between them) until it suspends or finishes.
+let piRef: ExtensionAPI | null = null;
+let stepping = false;                                  // mutex: one chain entry at a time
+const waitTimers = new Map<string, NodeJS.Timeout>();
+let sentinelTicker: NodeJS.Timeout | null = null;
+let runCtx: { ctx: any; change: string; dryRun: boolean; all: boolean; oneOff: boolean } | null = null;
+const LOOP_STATE_FILE = ".loop-state.json";
+
+interface LoopState {
+  phase: string;
+  inner: string | null;
+  round: number;
+  prNum: number;
+  head: string;
+  repo: string;
+  triggerAt: string | null;
+  reviewDeadline: number | null;
+  seenSignatures: string[];
+  suggestions: Suggestion[];
+  stopReason: string | null;
+}
+
+function statePath(repoRoot: string, change: string): string {
+  return join(repoRoot, WORKTREE_ROOT, change, LOOP_STATE_FILE);
+}
+function readLoopState(repoRoot: string, change: string): LoopState | null {
+  try {
+    const p = statePath(repoRoot, change);
+    if (!existsSync(p)) return null;
+    return JSON.parse(readFileSync(p, "utf-8")) as LoopState;
+  } catch { return null; }
+}
+function writeLoopState(repoRoot: string, change: string, s: LoopState): void {
+  const p = statePath(repoRoot, change);
+  const tmp = `${p}.tmp`;
+  try { writeFileSync(tmp, JSON.stringify(s)); renameSync(tmp, p); } catch { /* resume re-derives */ }
+}
+function clearLoopState(repoRoot: string, change: string): void {
+  try { unlinkSync(statePath(repoRoot, change)); } catch { /* already gone */ }
+}
+function clearWaitTimer(change: string): void {
+  const t = waitTimers.get(change);
+  if (t) { clearTimeout(t); waitTimers.delete(change); }
+}
+function scheduleWait(ms: number): void {
+  if (!runCtx) return;
+  const change = runCtx.change;
+  clearWaitTimer(change);
+  const t = setTimeout(() => { void runLoopChain(); }, ms);
+  t.unref?.();
+  waitTimers.set(change, t);
+}
+const yieldTick = (): Promise<void> => new Promise((r) => setImmediate(r));
+
+/** 1s ticker that turns a sentinel file (touched from any terminal) into a
+ *  control signal — the cross-terminal path, since /loop fetch|stop only work
+ *  inside the pi session. Runs only while a loop is active. */
+function startSentinelTicker(ctx: any): void {
+  stopSentinelTicker();
+  sentinelTicker = setInterval(() => {
+    if (!runCtx) return;
+    const root = ctx.cwd as string;
+    const stopP = join(root, STOP_SENTINEL);
+    const fetchP = join(root, FETCH_SENTINEL);
+    if (existsSync(stopP)) { try { unlinkSync(stopP); } catch { /* gone */ } applyControl(ctx, "stop"); }
+    else if (existsSync(fetchP)) { try { unlinkSync(fetchP); } catch { /* gone */ } applyControl(ctx, "fetch"); }
+  }, POLL_TICK_MS);
+  sentinelTicker.unref?.();
+}
+function stopSentinelTicker(): void {
+  if (sentinelTicker) { clearInterval(sentinelTicker); sentinelTicker = null; }
 }
 
 /** Run a command via pi.exec, optionally in cwd; returns trimmed stdout + exit code. */
@@ -388,34 +481,6 @@ async function readCodexVerdict(
   return null;
 }
 
-/** Poll readCodexVerdict every REVIEW_WAIT_MS until a verdict lands or the cap hits. */
-async function pollCodexVerdict(
-  pi: ExtensionAPI,
-  ctx: any,
-  repo: string,
-  prNum: number,
-  head: string,
-  triggerAt: string
-): Promise<PollResult> {
-  const deadline = Date.now() + REVIEW_TOTAL_TIMEOUT_MS;
-  while (Date.now() < deadline) {
-    // Check before sleeping: a verdict may already be on the PR — Codex may have
-    // finished while the loop was stopped, or replied quickly after the trigger.
-    const v = await readCodexVerdict(pi, repo, prNum, head, triggerAt);
-    if (v) return v;
-    ctx.ui.notify(
-      `dev-loop: no Codex verdict for ${shortSha(head)} yet; retrying in ${REVIEW_WAIT_MS / 60000}min…`,
-      "info"
-    );
-    const wake = await sleepPoll(REVIEW_WAIT_MS);
-    if (wake === "stop") {
-      return { pass: false, timeout: false, stopped: true, quotaExhausted: false, suggestions: [] };
-    }
-    // wake === "fetch" (flag consumed) or "ok" → loop and re-check now.
-  }
-  return { pass: false, timeout: true, stopped: false, quotaExhausted: false, suggestions: [] };
-}
-
 // --- agent-driven phases (each scoped to the change's worktree) ----------------
 async function buildPhase(
   pi: ExtensionAPI,
@@ -492,47 +557,58 @@ async function checkPreconditions(pi: ExtensionAPI, ctx: any): Promise<boolean> 
 }
 
 /** Wraps runTask to toggle loopActive (read by the input handler). */
-async function runTaskGuarded(pi: ExtensionAPI, ctx: any, change: string, dryRun: boolean): Promise<boolean> {
-  loopActive = true;
-  try {
-    return await runTask(pi, ctx, change, dryRun);
-  } finally {
-    loopActive = false;
-  }
-}
+// --- per-change pipeline (re-entrant state machine) ---------------------------
+// runPrefix: resolve → provision → build (linear; agent turns, pi steer-OK).
+//   Returns at the review boundary; never blocks on a poll.
+// oneStep: one transition of the review inner machine OR the archive/merge/cleanup
+//   suffix; writes state, returns cont|suspend|done|stop.
+// driveChange: drives one change from current state to suspend/completion.
+// runLoopChain: entry; serializes steps (setImmediate yield), chains --all, toggles
+//   loopActive, owns the sentinel ticker + wait timer lifecycle.
 
-// --- per-change pipeline -------------------------------------------------------
-async function runTask(
+type PrefixResult =
+  | { kind: "atReview"; prNum: number; head: string; repo: string }
+  | { kind: "stop" }
+  | { kind: "merged" }
+  | { kind: "abort" }
+  | { kind: "dryRun" };
+
+async function runPrefix(
   pi: ExtensionAPI,
   ctx: any,
   change: string,
   dryRun: boolean
-): Promise<boolean> {
+): Promise<PrefixResult> {
   const repoRoot = ctx.cwd as string;
   const wtDir = join(repoRoot, WORKTREE_ROOT, change);
 
   ctx.ui.notify(`dev-loop: change → ${change} (worktree ${wtDir})`, "info");
 
-  // Fresh run: clear any stale control flags left by a previous /loop stop.
+  // Fresh run: clear any stale control flags + sentinels left by a previous run.
   stopRequested = false;
   fetchRequested = false;
+  for (const s of [FETCH_SENTINEL, STOP_SENTINEL]) {
+    try { unlinkSync(join(repoRoot, s)); } catch { /* already gone */ }
+  }
 
   await ensureLocalIgnore(pi, repoRoot, `${WORKTREE_ROOT}/`);
+  await ensureLocalIgnore(pi, repoRoot, FETCH_SENTINEL);
+  await ensureLocalIgnore(pi, repoRoot, STOP_SENTINEL);
+  await ensureLocalIgnore(pi, repoRoot, LOOP_STATE_FILE);
 
-  // Resolve repo + detect prior-run state (for resume).
   const { stdout: repoOut } = await run(pi, "gh", ["repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner"], repoRoot);
   const repo = repoOut || "";
   if (!repo) {
     ctx.ui.notify("dev-loop: could not resolve repo via `gh repo view`", "error");
-    return false;
+    return { kind: "abort" };
   }
   const pr = await prStateFor(pi, repo, change);
 
-  // Already merged in a prior run, but cleanup / TODO-mark didn't finish → finish up.
+  // Already merged in a prior run → finish cleanup.
   if (pr.merged) {
     if (existsSync(wtDir)) await removeWorktree(pi, repoRoot, change);
     ctx.ui.notify(`dev-loop: ${change} already merged in a prior run — cleaning up`, "info");
-    return true;
+    return { kind: "merged" };
   }
 
   // Create the worktree only on a fresh run; a resume reuses the existing one.
@@ -540,7 +616,7 @@ async function runTask(
     const { stderr: fetchErr, code: fetchCode } = await run(pi, "git", ["fetch", "origin", "main"], repoRoot);
     if (fetchCode !== 0) {
       ctx.ui.notify(`dev-loop: git fetch origin main failed: ${fetchErr}`, "error");
-      return false;
+      return { kind: "abort" };
     }
     const { stderr: wtErr, code: wtCode } = await run(
       pi,
@@ -550,24 +626,17 @@ async function runTask(
     );
     if (wtCode !== 0) {
       ctx.ui.notify(`dev-loop: git worktree add failed: ${wtErr}`, "error");
-      return false;
+      return { kind: "abort" };
     }
   } else {
     ctx.ui.notify(`dev-loop: resuming — reusing worktree ${wtDir}`, "info");
   }
 
-  // Bring gitignored .env* (monorepo-wide) into the worktree.
   const envCopied = copyEnvFiles(repoRoot, wtDir);
   if (envCopied) {
     ctx.ui.notify(`dev-loop: copied ${envCopied} env file(s) (.env*) into worktree`, "info");
   }
 
-  // Ensure openspec is present in the worktree. The worktree is created from
-  // origin/main, so if openspec isn't there yet (git-ignored, or just never
-  // committed), copy the whole dir from the main repo — not committed, since in
-  // the ignored case `git add` can't and in the merely-untracked case
-  // scaffolding shouldn't pollute the PR. Otherwise, if openspec is on main but
-  // this change isn't, bring in just the change dir and commit it on the branch.
   const wtChangeDir = join(wtDir, "openspec", "changes", change);
   if (!existsSync(join(wtDir, "openspec"))) {
     cpSync(join(repoRoot, "openspec"), join(wtDir, "openspec"), { recursive: true });
@@ -577,19 +646,19 @@ async function runTask(
     if (!existsSync(srcChangeDir)) {
       ctx.ui.notify(`dev-loop: openspec change "${change}" not found under openspec/changes/; aborting`, "error");
       await removeWorktree(pi, repoRoot, change);
-      return false;
+      return { kind: "abort" };
     }
     cpSync(srcChangeDir, wtChangeDir, { recursive: true });
     await run(pi, "git", ["add", `openspec/changes/${change}`], wtDir);
     await run(pi, "git", ["commit", "-m", `spec: add ${change} change`], wtDir);
   }
 
-  // buildPhase — skip if a PR is already open (build shipped in a prior run).
   if (dryRun) {
     if (!pr.open) await buildPhase(pi, ctx, change, wtDir, true);
     ctx.ui.notify(`dev-loop: --dry-run → stopping (worktree left at ${wtDir})`, "info");
-    return false;
+    return { kind: "dryRun" };
   }
+
   let prNum: number;
   if (pr.open) {
     prNum = pr.prNum as number;
@@ -599,186 +668,261 @@ async function runTask(
     if (stopRequested) {
       interruptedChange = change;
       ctx.ui.notify(`dev-loop: stopped during build — worktree left; use /loop resume`, "warning");
-      return false;
+      return { kind: "stop" };
     }
-    // buildPhase must have opened a PR (also catches the agent working outside
-    // the worktree — no push of <change> ⇒ no PR).
     const after = await prStateFor(pi, repo, change);
     if (!after.open) {
       ctx.ui.notify("dev-loop: no open PR after buildPhase; aborting (worktree left)", "error");
-      return false;
+      return { kind: "abort" };
     }
     prNum = after.prNum as number;
   }
+
   ctx.ui.notify(`dev-loop: PR #${prNum} — starting Codex review loop`, "info");
+  const { stdout: head } = await run(pi, "git", ["rev-parse", "HEAD"], wtDir);
+  return { kind: "atReview", prNum, head, repo };
+}
 
-  // Review loop — keeps fixing until Codex passes; git ops target the worktree.
-  // Verdicts are keyed on the HEAD commit, not wall-clock: a pass/fail review
-  // already on the current head is reused instead of re-triggering, so a stop
-  // mid-review or a resume can't blind the loop to a verdict Codex already gave.
-  const seenSignatures: string[] = [];
-  for (let round = 1; ; round++) {
-    // Reconcile local HEAD with origin/<change> before trusting it for verdict
-    // matching (readCodexVerdict keys on local HEAD) and for the fast-forward
-    // push below. "local ≠ origin" splits into two opposite cases:
-    //   - local ahead (a manual commit, or a push that failed silently last
-    //     round): fast-forward push to self-heal, then proceed.
-    //   - origin ahead or diverged (GitHub "Update branch", a collaborator, a
-    //     CI bot): stop for a human — the push would be non-fast-forward and the
-    //     review would land on the wrong head.
-    await run(pi, "git", ["fetch", "origin", change], wtDir);
-    const { stdout: localHead } = await run(pi, "git", ["rev-parse", "HEAD"], wtDir);
-    const { stdout: remoteHead } = await run(pi, "git", ["rev-parse", `origin/${change}`], wtDir);
-    if (remoteHead && localHead && remoteHead !== localHead) {
-      // exit 0 => remoteHead is an ancestor of localHead => local is ahead (FF).
-      const { code: ffCode } = await run(
-        pi, "git", ["merge-base", "--is-ancestor", remoteHead, localHead], wtDir,
-      );
-      if (ffCode === 0) {
-        const { code: syncCode, stderr: syncErr } = await run(pi, "git", ["push"], wtDir);
-        if (syncCode !== 0) {
-          interruptedChange = change;
-          ctx.ui.notify(
-            `dev-loop: sync push failed (${syncErr}); stopping (PR + worktree left) — fix then /loop resume`,
-            "error",
-          );
-          return false;
+/** Find the change's checkbox line and flip it to [x]. */
+function markChangeDone(cwd: string, change: string): void {
+  const t = pickTask(cwd);
+  if (t && t.text === change) markDone(cwd, t.lineNo);
+  else markDone(cwd, ensureTodoEntry(cwd, change));
+}
+
+/** WAIT-step decision (pure, for testability). Precedence: a fetch request
+ *  preempts the deadline — an explicit "recheck now" always re-probes, even if
+ *  the cap elapsed, instead of timing out. */
+export function waitAction(fetchRequested: boolean, reviewDeadline: number | null, now: number): "recheck" | "timeout" | "wait" {
+  if (fetchRequested) return "recheck";
+  if (reviewDeadline !== null && now > reviewDeadline) return "timeout";
+  return "wait";
+}
+
+/** One state-machine transition. Mutates `s` and persists it. */
+async function oneStep(
+  pi: ExtensionAPI,
+  ctx: any,
+  change: string,
+  s: LoopState
+): Promise<"cont" | "suspend" | "done" | "stop"> {
+  const repoRoot = ctx.cwd as string;
+  const wtDir = join(repoRoot, WORKTREE_ROOT, change);
+  const wtChangeDir = join(wtDir, "openspec", "changes", change);
+  const persist = () => writeLoopState(repoRoot, change, s);
+
+  if (s.phase === PHASE.REVIEW) {
+    if (s.inner === REVIEW_INNER.RECONCILE) {
+      await run(pi, "git", ["fetch", "origin", change], wtDir);
+      const { stdout: localHead } = await run(pi, "git", ["rev-parse", "HEAD"], wtDir);
+      const { stdout: remoteHead } = await run(pi, "git", ["rev-parse", `origin/${change}`], wtDir);
+      if (remoteHead && localHead && remoteHead !== localHead) {
+        const { code: ffCode } = await run(pi, "git", ["merge-base", "--is-ancestor", remoteHead, localHead], wtDir);
+        if (ffCode === 0) {
+          const { code, stderr } = await run(pi, "git", ["push"], wtDir);
+          if (code !== 0) {
+            s.stopReason = "sync_push_failed"; interruptedChange = change;
+            ctx.ui.notify(`dev-loop: sync push failed (${stderr}); stopping — fix then /loop resume`, "error");
+            persist(); return "stop";
+          }
+        } else {
+          s.stopReason = "diverged"; interruptedChange = change;
+          ctx.ui.notify(`dev-loop: origin/${change} ${shortSha(remoteHead)} ahead of / diverged from local ${shortSha(localHead)}; stopping — resolve then /loop resume`, "error");
+          persist(); return "stop";
         }
-      } else {
-        interruptedChange = change;
-        ctx.ui.notify(
-          `dev-loop: origin/${change} ${shortSha(remoteHead)} is ahead of / diverged from local ${shortSha(localHead)} (external push/merge, e.g. "Update branch"); stopping — resolve then /loop resume`,
-          "error",
-        );
-        return false;
+      }
+      s.head = localHead;
+      s.inner = REVIEW_INNER.PROBE; persist(); return "cont";
+    }
+    if (s.inner === REVIEW_INNER.PROBE) {
+      const v = await readCodexVerdict(pi, s.repo, s.prNum, s.head, s.triggerAt);
+      if (!v) {
+        s.inner = s.triggerAt ? REVIEW_INNER.WAIT : REVIEW_INNER.TRIGGER;
+        persist(); return "cont";
+      }
+      if (v.pass || v.suggestions.length === 0) {
+        ctx.ui.notify(`dev-loop: Codex passed on round ${s.round}`, "info");
+        s.phase = PHASE.ARCHIVE; s.inner = null; persist(); return "cont";
+      }
+      if (v.quotaExhausted) {
+        s.stopReason = "quota"; interruptedChange = change;
+        ctx.ui.notify(`dev-loop: Codex review quota exhausted — stopping (PR + worktree left); use /loop resume after it resets`, "warning");
+        persist(); return "stop";
+      }
+      const sig = suggestionKey(v.suggestions);
+      if (s.seenSignatures.includes(sig)) {
+        s.stopReason = "repeat"; interruptedChange = change;
+        ctx.ui.notify(`dev-loop: round ${s.round} repeats a prior review (fixes not landing); stopping (PR + worktree left)`, "warning");
+        persist(); return "stop";
+      }
+      s.seenSignatures.push(sig);
+      s.suggestions = v.suggestions;
+      s.inner = REVIEW_INNER.FIX; persist(); return "cont";
+    }
+    if (s.inner === REVIEW_INNER.TRIGGER) {
+      const { code, stderr } = await run(pi, "gh", ["pr", "comment", String(s.prNum), "--body", "@codex review", "--repo", s.repo]);
+      if (code !== 0) {
+        s.stopReason = "trigger_failed";
+        ctx.ui.notify(`dev-loop: trigger @codex review failed: ${stderr}`, "error");
+        persist(); return "stop";
+      }
+      s.triggerAt = await latestCommentAt(pi, s.repo, s.prNum);
+      s.reviewDeadline = Date.now() + REVIEW_TOTAL_TIMEOUT_MS;
+      s.inner = REVIEW_INNER.WAIT;
+      ctx.ui.notify(`dev-loop: round ${s.round} on ${shortSha(s.head)} — polling Codex every ${REVIEW_WAIT_MS / 60000}min (≤${REVIEW_TOTAL_TIMEOUT_MS / 60000}min; touch ${FETCH_SENTINEL} to recheck)…`, "info");
+      persist(); return "cont";
+    }
+    if (s.inner === REVIEW_INNER.WAIT) {
+      switch (waitAction(fetchRequested, s.reviewDeadline, Date.now())) {
+        case "recheck":
+          fetchRequested = false;
+          s.inner = REVIEW_INNER.RECONCILE;
+          ctx.ui.notify("dev-loop: fetch — rechecking Codex now", "info");
+          persist(); return "cont";
+        case "timeout":
+          s.stopReason = "timeout"; interruptedChange = change;
+          ctx.ui.notify(`dev-loop: no Codex review after ${REVIEW_TOTAL_TIMEOUT_MS / 60000}min on round ${s.round}; stopping (PR + worktree left)`, "warning");
+          persist(); return "stop";
+        default:
+          scheduleWait(REVIEW_WAIT_MS);
+          return "suspend";
       }
     }
-    const head = localHead;
-    let result = await readCodexVerdict(pi, repo, prNum, head, null);
-    if (!result) {
-      const { code: trigCode, stderr: trigErr } = await run(pi, "gh", [
-        "pr", "comment", String(prNum), "--body", "@codex review", "--repo", repo,
-      ]);
-      if (trigCode !== 0) {
-        ctx.ui.notify(`dev-loop: trigger @codex review failed: ${trigErr}`, "error");
-        return false;
+    if (s.inner === REVIEW_INNER.FIX) {
+      const { stdout: headPre } = await run(pi, "git", ["rev-parse", "HEAD"], wtDir);
+      await fixPhase(pi, ctx, change, wtDir, s.prNum, s.round, s.suggestions);
+      if (stopRequested) {
+        s.stopReason = "stopped"; interruptedChange = change;
+        ctx.ui.notify(`dev-loop: stopped during fix round ${s.round} — PR + worktree left; use /loop resume`, "warning");
+        persist(); return "stop";
       }
-      // Gate quota on this trigger's timestamp so a stale quota comment (e.g. from
-      // before a resume) can't fire; only a fresh quota response stops the loop.
-      const triggerAt = await latestCommentAt(pi, repo, prNum);
-      ctx.ui.notify(
-        `dev-loop: round ${round} on ${shortSha(head)} — polling Codex every ${REVIEW_WAIT_MS / 60000}min (≤${REVIEW_TOTAL_TIMEOUT_MS / 60000}min)…`,
-        "info"
-      );
-      result = await pollCodexVerdict(pi, ctx, repo, prNum, head, triggerAt);
-    } else {
-      ctx.ui.notify(
-        `dev-loop: round ${round} on ${shortSha(head)} — reusing existing Codex verdict`,
-        "info"
-      );
+      const { stdout: headPost } = await run(pi, "git", ["rev-parse", "HEAD"], wtDir);
+      if (headPre === headPost) {
+        s.stopReason = "no_progress"; interruptedChange = change;
+        ctx.ui.notify(`dev-loop: agent made no progress on round ${s.round}; stopping (PR + worktree left)`, "warning");
+        persist(); return "stop";
+      }
+      const { code: pushCode, stderr: pushErr } = await run(pi, "git", ["push"], wtDir);
+      if (pushCode !== 0) {
+        s.stopReason = "push_failed"; interruptedChange = change;
+        ctx.ui.notify(`dev-loop: git push failed on round ${s.round} (${pushErr}); stopping — fix then /loop resume`, "error");
+        persist(); return "stop";
+      }
+      s.round++;
+      s.inner = REVIEW_INNER.RECONCILE; persist(); return "cont";
     }
-
-    if (result.stopped) {
-      interruptedChange = change;
-      ctx.ui.notify(`dev-loop: stopped by /loop stop — PR + worktree left; use /loop resume`, "warning");
-      return false;
-    }
-    if (result.quotaExhausted) {
-      interruptedChange = change;
-      ctx.ui.notify(
-        `dev-loop: Codex review quota exhausted — stopping (PR + worktree left); use /loop resume after the quota resets`,
-        "warning"
-      );
-      return false;
-    }
-    if (result.pass) {
-      ctx.ui.notify(`dev-loop: Codex passed on round ${round}`, "info");
-      break;
-    }
-    if (result.timeout) {
-      ctx.ui.notify(
-        `dev-loop: no Codex review after ${REVIEW_TOTAL_TIMEOUT_MS / 60000}min on round ${round}; stopping (PR + worktree left)`,
-        "warning"
-      );
-      return false;
-    }
-    if (result.suggestions.length === 0) {
-      ctx.ui.notify(`dev-loop: round ${round} review had no actionable items; treating as pass`, "info");
-      break;
-    }
-
-    // Flip-flop guard: same review set we already fixed → fixes aren't landing.
-    const sig = suggestionKey(result.suggestions);
-    if (seenSignatures.includes(sig)) {
-      ctx.ui.notify(
-        `dev-loop: round ${round} repeats a prior review (fixes not landing); stopping (PR + worktree left)`,
-        "warning"
-      );
-      return false;
-    }
-    seenSignatures.push(sig);
-
-    const { stdout: headPre } = await run(pi, "git", ["rev-parse", "HEAD"], wtDir);
-    await fixPhase(pi, ctx, change, wtDir, prNum, round, result.suggestions);
-    if (stopRequested) {
-      interruptedChange = change;
-      ctx.ui.notify(`dev-loop: stopped during fix round ${round} — PR + worktree left; use /loop resume`, "warning");
-      return false;
-    }
-    const { stdout: headPost } = await run(pi, "git", ["rev-parse", "HEAD"], wtDir);
-    if (headPre === headPost) {
-      ctx.ui.notify(`dev-loop: agent made no progress on round ${round}; stopping (PR + worktree left)`, "warning");
-      return false;
-    }
-    // A failed push (non-fast-forward from an external advance, network, auth)
-    // used to be swallowed silently — the loop kept committing locally while the
-    // PR never advanced. Treat any push failure as terminal so the divergence
-    // surfaces instead of rotting for N rounds.
-    const { code: pushCode, stderr: pushErr } = await run(pi, "git", ["push"], wtDir);
-    if (pushCode !== 0) {
-      interruptedChange = change;
-      ctx.ui.notify(
-        `dev-loop: git push failed on round ${round} (${pushErr}); stopping (PR + worktree left) — fix then /loop resume`,
-        "error",
-      );
-      return false;
-    }
+    s.stopReason = "bad_state"; persist(); return "stop";
   }
 
-  // Archive the change (fold specs into openspec/specs, move to archive/). Idempotent on resume.
-  if (existsSync(wtChangeDir)) {
-    const { code: arcCode, stderr: arcErr } = await run(pi, "openspec", ["archive", change, "-y"], wtDir);
-    if (arcCode !== 0) {
-      ctx.ui.notify(`dev-loop: openspec archive failed: ${arcErr}; stopping (PR + worktree left)`, "warning");
-      return false;
-    }
-    const { stdout: dirty } = await run(pi, "git", ["status", "--porcelain"], wtDir);
-    if (dirty) {
-      await run(pi, "git", ["add", "-A"], wtDir);
-      await run(pi, "git", ["commit", "-m", `chore: archive ${change}`], wtDir);
-      const { code: arcPushCode, stderr: arcPushErr } = await run(pi, "git", ["push"], wtDir);
-      if (arcPushCode !== 0) {
-        interruptedChange = change;
-        ctx.ui.notify(
-          `dev-loop: git push of archive commit failed (${arcPushErr}); stopping (PR + worktree left) — fix then /loop resume`,
-          "error",
-        );
-        return false;
+  if (s.phase === PHASE.ARCHIVE) {
+    if (existsSync(wtChangeDir)) {
+      const { code, stderr } = await run(pi, "openspec", ["archive", change, "-y"], wtDir);
+      if (code !== 0) {
+        s.stopReason = "archive_failed"; interruptedChange = change;
+        ctx.ui.notify(`dev-loop: openspec archive failed: ${stderr}; stopping (PR + worktree left)`, "warning");
+        persist(); return "stop";
+      }
+      const { stdout: dirty } = await run(pi, "git", ["status", "--porcelain"], wtDir);
+      if (dirty) {
+        await run(pi, "git", ["add", "-A"], wtDir);
+        await run(pi, "git", ["commit", "-m", `chore: archive ${change}`], wtDir);
+        const { code: pc, stderr: pe } = await run(pi, "git", ["push"], wtDir);
+        if (pc !== 0) {
+          s.stopReason = "archive_push_failed"; interruptedChange = change;
+          ctx.ui.notify(`dev-loop: git push of archive commit failed (${pe}); stopping — fix then /loop resume`, "error");
+          persist(); return "stop";
+        }
       }
     }
+    s.phase = PHASE.MERGE; persist(); return "cont";
   }
 
-  // Merge directly — Codex passed, so conditions are met.
-  const { code: mergeCode, stderr: mergeErr } = await run(pi, "gh", [
-    "pr", "merge", String(prNum), "--squash", "--delete-branch", "--repo", repo,
-  ]);
-  if (mergeCode !== 0) {
-    ctx.ui.notify(`dev-loop: gh pr merge failed: ${mergeErr}`, "error");
-    return false;
+  if (s.phase === PHASE.MERGE) {
+    const { code, stderr } = await run(pi, "gh", ["pr", "merge", String(s.prNum), "--squash", "--delete-branch", "--repo", s.repo]);
+    if (code !== 0) {
+      s.stopReason = "merge_failed";
+      ctx.ui.notify(`dev-loop: gh pr merge failed: ${stderr}`, "error");
+      persist(); return "stop";
+    }
+    s.phase = PHASE.CLEANUP; persist(); return "cont";
   }
-  await removeWorktree(pi, repoRoot, change);
-  ctx.ui.notify(`dev-loop: merged PR #${prNum} + removed worktree ✅`, "info");
-  return true;
+
+  if (s.phase === PHASE.CLEANUP) {
+    await removeWorktree(pi, repoRoot, change);
+    return "done";
+  }
+
+  s.stopReason = "bad_state"; persist(); return "stop";
+}
+
+/** Drive one change from its persisted state to suspension or completion. */
+async function driveChange(
+  pi: ExtensionAPI,
+  ctx: any,
+  change: string,
+  dryRun: boolean
+): Promise<"completed" | "suspended" | "stopped" | "aborted"> {
+  const repoRoot = ctx.cwd as string;
+  let s = readLoopState(repoRoot, change);
+  if (!s || s.phase === PHASE.RESOLVE || s.phase === PHASE.PROVISION || s.phase === PHASE.BUILD) {
+    const r = await runPrefix(pi, ctx, change, dryRun);
+    if (r.kind === "stop") return "stopped";
+    if (r.kind === "merged") return "completed";
+    if (r.kind !== "atReview") return "aborted";
+    s = {
+      phase: PHASE.REVIEW, inner: REVIEW_INNER.RECONCILE, round: 1,
+      prNum: r.prNum, head: r.head, repo: r.repo,
+      triggerAt: null, reviewDeadline: null, seenSignatures: [], suggestions: [], stopReason: null,
+    };
+    writeLoopState(repoRoot, change, s);
+  }
+  while (true) {
+    if (stopRequested) { s.stopReason = "stopped"; writeLoopState(repoRoot, change, s); return "stopped"; }
+    const out = await oneStep(pi, ctx, change, s);
+    if (out === "suspend") return "suspended";
+    if (out === "done") return "completed";
+    if (out === "stop") return "stopped";
+    await yieldTick();
+  }
+}
+
+/** Re-entrant entry. Called by the /loop handler, the review_wait timer, and
+ *  /loop fetch. Runs steps (setImmediate yield between them) until the current
+ *  change suspends or finishes; for --all, chains the next TODO change. */
+async function runLoopChain(): Promise<void> {
+  if (!piRef || !runCtx || stepping) return;
+  const pi = piRef;
+  const ctx = runCtx.ctx;
+  stepping = true;
+  try {
+    while (runCtx) {
+      if (stopRequested) {
+        interruptedChange = runCtx.change;
+        ctx.ui.notify(`dev-loop: stopped (PR + worktree left); use /loop resume`, "warning");
+        loopActive = false; stopSentinelTicker(); runCtx = null;
+        return;
+      }
+      const outcome = await driveChange(pi, ctx, runCtx.change, runCtx.dryRun);
+      if (outcome === "suspended") return;             // review_wait; timer re-enters
+      if (outcome === "completed") {
+        if (!runCtx.oneOff) markChangeDone(ctx.cwd as string, runCtx.change);
+        clearLoopState(ctx.cwd as string, runCtx.change);
+        ctx.ui.notify(`dev-loop: "${runCtx.change}" merged ✅`, "info");
+        if (runCtx.all && !runCtx.oneOff) {
+          const next = pickTask(ctx.cwd as string);
+          if (next) { runCtx = { ...runCtx, change: next.text }; continue; }
+        }
+        loopActive = false; stopSentinelTicker(); runCtx = null;
+        return;
+      }
+      // stopped / aborted: leave PR + worktree; stop the chain
+      if (outcome === "stopped") interruptedChange = runCtx.change;
+      loopActive = false; stopSentinelTicker(); runCtx = null;
+      return;
+    }
+  } finally {
+    stepping = false;
+  }
 }
 
 // --- project init (/loop init) ------------------------------------------------
@@ -821,20 +965,21 @@ async function initProject(pi: ExtensionAPI, ctx: any) {
 
 // --- entry point ---------------------------------------------------------------
 export default function (pi: ExtensionAPI) {
+  piRef = pi;
   pi.on("agent_end", () => {
     const r = turnResolve;
     turnResolve = null;
     r && r();
   });
 
-  // While a /loop run is in flight, free-text submits don't help (only
-  // /loop stop|fetch|resume do). Slash commands bypass this event, so they still
-  // work; this just reminds the user + consumes stray free-text that would
-  // otherwise cut the loop's agent turn short. The loop's own sendUserMessage
-  // calls have source "extension" and pass through unchanged.
+  // loopActive is true across a whole run, including the suspended review_wait
+  // window (where the handler has returned and pi is back at its prompt). There,
+  // free-text DOES reach this event and is consumed; during an active agent turn
+  // (build/fix) it queues instead. The loop's own sendUserMessage calls have
+  // source "extension" and pass through unchanged.
   pi.on("input", async (event, ctx) => {
     if (loopActive && event.source === "interactive") {
-      ctx.ui.notify("dev-loop is running — use /loop stop | /loop fetch | /loop resume (free-text is ignored)", "info");
+      ctx.ui.notify("dev-loop is running — use /loop fetch | /loop stop (or touch .dev-loop-fetch / .dev-loop-stop); free-text is ignored", "info");
       return { action: "handled" };
     }
     return { action: "continue" };
@@ -857,15 +1002,11 @@ export default function (pi: ExtensionAPI) {
       // just flip module-level flags the loop reads at its checkpoints. Slash
       // commands bypass the input event, so these always reach the handler.
       if (sub === "stop") {
-        if (!loopActive) { ctx.ui.notify("dev-loop: no /loop is running", "warning"); return; }
-        stopRequested = true;
-        ctx.ui.notify("dev-loop: stop requested — will stop after the current step (PR + worktree kept)", "warning");
+        writeControl(ctx, STOP_SENTINEL, "stop");
         return;
       }
       if (sub === "fetch") {
-        if (!loopActive) { ctx.ui.notify("dev-loop: no /loop is running", "warning"); return; }
-        fetchRequested = true;
-        ctx.ui.notify("dev-loop: fetch requested — will re-poll Codex review now", "info");
+        writeControl(ctx, FETCH_SENTINEL, "fetch");
         return;
       }
       if (sub === "resume") {
@@ -876,12 +1017,18 @@ export default function (pi: ExtensionAPI) {
         if (!(await checkPreconditions(pi, ctx))) return;
         const ch = interruptedChange;
         ctx.ui.notify(`dev-loop: resuming "${ch}"`, "info");
-        const merged = await runTaskGuarded(pi, ctx, ch, false);
-        if (merged) ctx.ui.notify(`dev-loop: "${ch}" merged ✅`, "info");
+        runCtx = { ctx, change: ch, dryRun: false, all: false, oneOff: true };
+        loopActive = true;
+        stopRequested = false;
+        clearWaitTimer(ch);
+        startSentinelTicker(ctx);
+        await runLoopChain();
         return;
       }
 
-      // Normal run: /loop [change] [--dry-run] [--all].
+      // Normal run: /loop [change] [--dry-run] [--all]. Hand off to the
+      // non-blocking driver; it iterates --all itself, suspending across each
+      // review_wait via the persisted state + a timer.
       const dryRun = tokens.includes("--dry-run");
       const all = tokens.includes("--all");
       const positional = tokens.filter((t) => !t.startsWith("--"));
@@ -890,38 +1037,28 @@ export default function (pi: ExtensionAPI) {
 
       if (!(await checkPreconditions(pi, ctx))) return;
 
+      let firstChange: string | null = null;
       if (oneOff) {
         if (!existsSync(join(cwd, "openspec", "changes", oneOff))) {
           ctx.ui.notify(`dev-loop: change "${oneOff}" not found under openspec/changes/`, "error");
           return;
         }
-      } else if (!pickTask(cwd)) {
-        ctx.ui.notify("dev-loop: no unchecked `- [ ] <change>` line in TODO.md", "warning");
-        return;
+        firstChange = oneOff;
+      } else {
+        const t = pickTask(cwd);
+        if (!t) {
+          ctx.ui.notify("dev-loop: no unchecked `- [ ] <change>` line in TODO.md", "warning");
+          return;
+        }
+        firstChange = t.text;
       }
 
-      // Single change (one-off arg) or iterate TODO until done / --all.
-      while (true) {
-        let item: { text: string; lineNo: number | null } | null;
-        if (oneOff) {
-          const lineNo = ensureTodoEntry(cwd, oneOff);
-          item = { text: oneOff, lineNo };
-        } else {
-          const t = pickTask(cwd);
-          item = t ? { text: t.text, lineNo: t.lineNo } : null;
-        }
-        if (!item) {
-          ctx.ui.notify("dev-loop: no more changes", "info");
-          break;
-        }
-        const merged = await runTaskGuarded(pi, ctx, item.text, dryRun);
-        if (merged && item.lineNo) markDone(cwd, item.lineNo);
-        if (oneOff) break;
-        if (!all) {
-          ctx.ui.notify("dev-loop: one change done (use --all to continue)", "info");
-          break;
-        }
-      }
+      runCtx = { ctx, change: firstChange, dryRun, all, oneOff: !!oneOff };
+      loopActive = true;
+      stopRequested = false;
+      clearWaitTimer(firstChange);
+      startSentinelTicker(ctx);
+      await runLoopChain();
     },
   });
 }
