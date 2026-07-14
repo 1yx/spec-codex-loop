@@ -23,8 +23,8 @@
  * address review) is delegated to pi's agent, one bounded turn at a time, each
  * told to work inside the change's worktree.
  */
-import { cpSync, existsSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { dirname, join, relative } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 const CODEX_LOGIN = "chatgpt-codex-connector"; // bot login prefix; API may append "[bot]"
@@ -170,6 +170,35 @@ async function ensureLocalIgnore(pi: ExtensionAPI, repoRoot: string, entry: stri
   } catch {
     /* non-fatal */
   }
+}
+
+/** Copy `.env*` files from the main repo into the worktree at the same
+ *  relative path. These are nearly always gitignored, so the origin/main
+ *  checkout the worktree is built from is missing them. Walks the whole tree
+ *  (monorepo: env files can live under any package/app dir), skipping
+ *  .git/node_modules/.worktree (the last avoids walking into the worktree we
+ *  just created). Returns the number of files copied. */
+function copyEnvFiles(repoRoot: string, wtDir: string): number {
+  // .env and every variant (.env.local, .env.development, .env.[mode].local, …).
+  // .envrc / .environment etc. don't match (no `.` right after `.env`).
+  const isEnv = (name: string) => name === ".env" || name.startsWith(".env.");
+  const skip = new Set([".git", "node_modules", WORKTREE_ROOT]);
+  let n = 0;
+  const walk = (dir: string) => {
+    for (const e of readdirSync(dir, { withFileTypes: true })) {
+      if (e.isDirectory()) {
+        if (skip.has(e.name)) continue;
+        walk(join(dir, e.name));
+      } else if (isEnv(e.name)) {
+        const dest = join(wtDir, relative(repoRoot, join(dir, e.name)));
+        mkdirSync(dirname(dest), { recursive: true });
+        cpSync(join(dir, e.name), dest);
+        n++;
+      }
+    }
+  };
+  walk(repoRoot);
+  return n;
 }
 
 /** Remove a change's worktree + its local branch. Best-effort. */
@@ -525,6 +554,12 @@ async function runTask(
     }
   } else {
     ctx.ui.notify(`dev-loop: resuming — reusing worktree ${wtDir}`, "info");
+  }
+
+  // Bring gitignored .env* (monorepo-wide) into the worktree.
+  const envCopied = copyEnvFiles(repoRoot, wtDir);
+  if (envCopied) {
+    ctx.ui.notify(`dev-loop: copied ${envCopied} env file(s) (.env*) into worktree`, "info");
   }
 
   // Ensure openspec is present in the worktree. The worktree is created from
