@@ -716,7 +716,24 @@ async function oneStep(
   const persist = () => writeLoopState(repoRoot, change, s);
 
   if (s.phase === PHASE.REVIEW) {
-    if (s.inner === REVIEW_INNER.RECONCILE) {
+    // RECONCILE is also the resume/wake target: when we sleep we persist
+    // inner=RECONCILE, so every wake (timer, /loop fetch, resume) re-probes
+    // instead of re-scheduling forever. Legacy inner=WAIT (older builds) is
+    // folded back to RECONCILE on entry.
+    if (s.inner === REVIEW_INNER.RECONCILE || s.inner === REVIEW_INNER.WAIT) {
+      if (s.inner === REVIEW_INNER.WAIT) s.inner = REVIEW_INNER.RECONCILE;
+      switch (waitAction(fetchRequested, s.reviewDeadline, Date.now())) {
+        case "recheck":
+          fetchRequested = false;
+          ctx.ui.notify("dev-loop: fetch — rechecking Codex now", "info");
+          break;
+        case "timeout":
+          s.stopReason = "timeout"; interruptedChange = change;
+          ctx.ui.notify(`dev-loop: no Codex review after ${REVIEW_TOTAL_TIMEOUT_MS / 60000}min on round ${s.round}; stopping (PR + worktree left)`, "warning");
+          persist(); return "stop";
+        default:
+          break;
+      }
       await run(pi, "git", ["fetch", "origin", change], wtDir);
       const { stdout: localHead } = await run(pi, "git", ["rev-parse", "HEAD"], wtDir);
       const { stdout: remoteHead } = await run(pi, "git", ["rev-parse", `origin/${change}`], wtDir);
@@ -741,8 +758,15 @@ async function oneStep(
     if (s.inner === REVIEW_INNER.PROBE) {
       const v = await readCodexVerdict(pi, s.repo, s.prNum, s.head, s.triggerAt);
       if (!v) {
-        s.inner = s.triggerAt ? REVIEW_INNER.WAIT : REVIEW_INNER.TRIGGER;
-        persist(); return "cont";
+        if (!s.triggerAt) { s.inner = REVIEW_INNER.TRIGGER; persist(); return "cont"; }
+        // Triggered, no verdict yet → sleep. Persist RECONCILE (not WAIT) so the
+        // timer wake re-probes; the old WAIT-then-reschedule loop never re-read
+        // a verdict that landed between polls.
+        s.inner = REVIEW_INNER.RECONCILE;
+        ctx.ui.notify(`dev-loop: no Codex verdict on ${shortSha(s.head)} (round ${s.round}); waiting ${REVIEW_WAIT_MS / 60000}min — touch ${FETCH_SENTINEL} to recheck, /loop stop to stop`, "info");
+        persist();
+        scheduleWait(REVIEW_WAIT_MS);
+        return "suspend";
       }
       if (v.pass || v.suggestions.length === 0) {
         ctx.ui.notify(`dev-loop: Codex passed on round ${s.round}`, "info");
@@ -772,26 +796,11 @@ async function oneStep(
       }
       s.triggerAt = await latestCommentAt(pi, s.repo, s.prNum);
       s.reviewDeadline = Date.now() + REVIEW_TOTAL_TIMEOUT_MS;
-      s.inner = REVIEW_INNER.WAIT;
-      ctx.ui.notify(`dev-loop: round ${s.round} on ${shortSha(s.head)} — polling Codex every ${REVIEW_WAIT_MS / 60000}min (≤${REVIEW_TOTAL_TIMEOUT_MS / 60000}min; touch ${FETCH_SENTINEL} to recheck)…`, "info");
+      // Probe immediately (catches a fast review) rather than sleeping first; if
+      // still no verdict, PROBE falls through to the scheduled wait above.
+      s.inner = REVIEW_INNER.PROBE;
+      ctx.ui.notify(`dev-loop: round ${s.round} on ${shortSha(s.head)} — triggered @codex review, polling every ${REVIEW_WAIT_MS / 60000}min (≤${REVIEW_TOTAL_TIMEOUT_MS / 60000}min; touch ${FETCH_SENTINEL} to recheck)…`, "info");
       persist(); return "cont";
-    }
-    if (s.inner === REVIEW_INNER.WAIT) {
-      switch (waitAction(fetchRequested, s.reviewDeadline, Date.now())) {
-        case "recheck":
-          fetchRequested = false;
-          s.inner = REVIEW_INNER.RECONCILE;
-          ctx.ui.notify("dev-loop: fetch — rechecking Codex now", "info");
-          persist(); return "cont";
-        case "timeout":
-          s.stopReason = "timeout"; interruptedChange = change;
-          ctx.ui.notify(`dev-loop: no Codex review after ${REVIEW_TOTAL_TIMEOUT_MS / 60000}min on round ${s.round}; stopping (PR + worktree left)`, "warning");
-          persist(); return "stop";
-        default:
-          ctx.ui.notify(`dev-loop: waiting for Codex on ${shortSha(s.head)} (round ${s.round}); retrying in ${REVIEW_WAIT_MS / 60000}min — touch ${FETCH_SENTINEL} to recheck, /loop stop to stop`, "info");
-          scheduleWait(REVIEW_WAIT_MS);
-          return "suspend";
-      }
     }
     if (s.inner === REVIEW_INNER.FIX) {
       const { stdout: headPre } = await run(pi, "git", ["rev-parse", "HEAD"], wtDir);
