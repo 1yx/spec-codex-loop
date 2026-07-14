@@ -84,8 +84,12 @@ function applyControl(ctx: any, kind: "fetch" | "stop") {
     kind === "stop" ? "warning" : "info",
   );
   if (!runCtx) return;
+  // Both signals must wake a suspended loop: fetch to re-probe, stop to reach
+  // the terminal branch. Clearing the wait timer removes the only other wake
+  // source, so if we did NOT re-enter here the loop would deadlock in
+  // review_wait with stopRequested set and never processed.
   clearWaitTimer(runCtx.change);
-  if (kind === "fetch" && !stepping) void runLoopChain();
+  if (!stepping) void runLoopChain();
 }
 
 /** Command path: write the sentinel (cross-terminal trigger) then apply. */
@@ -784,6 +788,7 @@ async function oneStep(
           ctx.ui.notify(`dev-loop: no Codex review after ${REVIEW_TOTAL_TIMEOUT_MS / 60000}min on round ${s.round}; stopping (PR + worktree left)`, "warning");
           persist(); return "stop";
         default:
+          ctx.ui.notify(`dev-loop: waiting for Codex on ${shortSha(s.head)} (round ${s.round}); retrying in ${REVIEW_WAIT_MS / 60000}min — touch ${FETCH_SENTINEL} to recheck, /loop stop to stop`, "info");
           scheduleWait(REVIEW_WAIT_MS);
           return "suspend";
       }
@@ -897,6 +902,10 @@ async function runLoopChain(): Promise<void> {
   try {
     while (runCtx) {
       if (stopRequested) {
+        // Persist stopReason so the on-disk state reflects the stop (resume reads
+        // phase/inner to continue; interruptedChange is the in-memory resume key).
+        const s = readLoopState(ctx.cwd as string, runCtx.change);
+        if (s) { s.stopReason = "stopped"; writeLoopState(ctx.cwd as string, runCtx.change, s); }
         interruptedChange = runCtx.change;
         ctx.ui.notify(`dev-loop: stopped (PR + worktree left); use /loop resume`, "warning");
         loopActive = false; stopSentinelTicker(); runCtx = null;
