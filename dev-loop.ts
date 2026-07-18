@@ -336,7 +336,18 @@ async function removeWorktree(pi: ExtensionAPI, repoRoot: string, change: string
  *  No-op once TODO.md is tracked. Best-effort: a non-fast-forwardable main warns. */
 async function syncMain(pi: ExtensionAPI, ctx: any, repoRoot: string) {
   await run(pi, "git", ["fetch", "origin", "main"], repoRoot);
-  await run(pi, "git", ["checkout", "main"], repoRoot);
+  // The loop ran in a separate worktree; the main repo may still be on whatever
+  // branch the user left it on. Confirm we're on main, switch if not, and bail
+  // (best-effort) if the checkout is blocked — never merge into the wrong branch.
+  const { stdout: branch } = await run(pi, "git", ["rev-parse", "--abbrev-ref", "HEAD"], repoRoot);
+  if (branch !== "main") {
+    const { code, stderr } = await run(pi, "git", ["checkout", "main"], repoRoot);
+    if (code !== 0) {
+      ctx.ui.notify(`dev-loop: on ${branch}, couldn't switch to main (${stderr}); merge origin/main manually`, "warning");
+      return;
+    }
+    ctx.ui.notify(`dev-loop: ${branch} → main`, "info");
+  }
   const rootTodo = findTodoFile(repoRoot);
   if (rootTodo) {
     const { stdout } = await run(pi, "git", ["ls-files", "--", relative(repoRoot, rootTodo)], repoRoot);
@@ -344,6 +355,55 @@ async function syncMain(pi: ExtensionAPI, ctx: any, repoRoot: string) {
   }
   const { code, stderr } = await run(pi, "git", ["merge", "--ff-only", "origin/main"], repoRoot);
   if (code !== 0) ctx.ui.notify(`dev-loop: local main can't fast-forward to origin/main (${stderr}); merge manually`, "warning");
+}
+
+/** Reconcile the change branch with origin: sync origin/<change> (ff-push or
+ *  detect divergence), then check GitHub's authoritative `mergeable_state` for
+ *  whether main advanced. `behind` → clean main merge (auto-committed, caller
+ *  pushes); `dirty` → conflict (caller hands to an agent turn with the change's
+ *  context, which merges + resolves); `clean`/`unknown`/else → nothing to do
+ *  now (unknown is transient — GitHub hasn't finished computing; re-checks next cycle). */
+type ReconcileResult =
+  | { kind: "ok"; head: string }
+  | { kind: "diverged" }
+  | { kind: "sync_push_failed"; stderr: string }
+  | { kind: "main_merged_clean"; head: string }
+  | { kind: "main_conflict" };
+
+async function reconcileBranch(pi: ExtensionAPI, repo: string, prNum: number, wtDir: string, change: string): Promise<ReconcileResult> {
+  await run(pi, "git", ["fetch", "origin", "main", change], wtDir);
+  const { stdout: localHead } = await run(pi, "git", ["rev-parse", "HEAD"], wtDir);
+  const { stdout: remoteHead } = await run(pi, "git", ["rev-parse", `origin/${change}`], wtDir);
+  // 1. local vs origin/<change>: fast-forward-push local, or stop on real divergence.
+  if (remoteHead && localHead && remoteHead !== localHead) {
+    const { code: ffCode } = await run(pi, "git", ["merge-base", "--is-ancestor", remoteHead, localHead], wtDir);
+    if (ffCode === 0) {
+      const { code, stderr } = await run(pi, "git", ["push"], wtDir);
+      if (code !== 0) return { kind: "sync_push_failed", stderr };
+    } else {
+      return { kind: "diverged" };
+    }
+  }
+  // 2. main-merge state per GitHub's authoritative (async-computed) view.
+  const { stdout: ms } = await run(pi, "gh", ["api", `repos/${repo}/pulls/${prNum}`, "-q", ".mergeable_state"]);
+  const state = ms.trim().toLowerCase();
+  if (state === "behind") {
+    // main ahead, clean merge expected.
+    const { code } = await run(pi, "git", ["merge", "origin/main", "--no-edit"], wtDir);
+    if (code === 0) {
+      const { stdout: head } = await run(pi, "git", ["rev-parse", "HEAD"], wtDir);
+      return { kind: "main_merged_clean", head };
+    }
+    // race: GitHub said behind but the merge conflicted — hand to the resolver.
+    await run(pi, "git", ["merge", "--abort"], wtDir);
+    return { kind: "main_conflict" };
+  }
+  if (state === "dirty") {
+    // Conflict — don't merge here; the agent merges + resolves with the change's context.
+    return { kind: "main_conflict" };
+  }
+  // clean / unknown / blocked / … — nothing to do now (unknown re-checks next cycle).
+  return { kind: "ok", head: localHead };
 }
 
 /** Open/merged PR state for a change's head branch (used for resume). */
@@ -584,6 +644,29 @@ async function fixPhase(
     formatSuggestions(suggestions),
   ].join("\n");
   ctx.ui.notify(`dev-loop: addressing round ${round} review (driving agent…)`, "info");
+  await driveAgent(pi, prompt);
+}
+
+/** Review inner: origin/main advanced and conflicts with this change. The
+ *  agent runs `git merge origin/main` (it conflicts) then resolves using the
+ *  change's openspec context (design/specs/tasks) so the merge keeps the change's
+ *  semantics — not a blind merge. Agent commits; the loop pushes. */
+async function resolveMainPhase(pi: ExtensionAPI, ctx: any, change: string, wtDir: string) {
+  const prompt = [
+    `origin/main advanced and conflicts with the "${change}" change in this worktree.`,
+    `First run \`git merge origin/main\` (it will conflict), then resolve honoring what this change is meant to do.`,
+    "",
+    `Work inside the worktree (absolute paths; prefix shell with \`cd ${wtDir} &&\`): ${wtDir}`,
+    "",
+    "Context for this change — read it to understand intent before resolving:",
+    `  openspec status --change "${change}" --json`,
+    `  openspec instructions apply --change "${change}" --json`,
+    "  Read the listed contextFiles (design.md / specs) so the merge preserves this change's semantics.",
+    "",
+    "Then resolve every conflict (no unmerged files left), run tests, and commit the merge.",
+    "Do NOT push — the loop pushes after.",
+  ].join("\n");
+  ctx.ui.notify(`dev-loop: resolving origin/main merge conflicts for ${change} (driving agent…)`, "info");
   await driveAgent(pi, prompt);
 }
 
@@ -830,26 +913,59 @@ async function oneStep(
         default:
           break;
       }
-      await run(pi, "git", ["fetch", "origin", change], wtDir);
-      const { stdout: localHead } = await run(pi, "git", ["rev-parse", "HEAD"], wtDir);
-      const { stdout: remoteHead } = await run(pi, "git", ["rev-parse", `origin/${change}`], wtDir);
-      if (remoteHead && localHead && remoteHead !== localHead) {
-        const { code: ffCode } = await run(pi, "git", ["merge-base", "--is-ancestor", remoteHead, localHead], wtDir);
-        if (ffCode === 0) {
-          const { code, stderr } = await run(pi, "git", ["push"], wtDir);
-          if (code !== 0) {
-            s.stopReason = "sync_push_failed"; interruptedChange = change;
-            ctx.ui.notify(`dev-loop: sync push failed (${stderr}); stopping — fix then /loop resume`, "error");
-            persist(); return "stop";
-          }
-        } else {
-          s.stopReason = "diverged"; interruptedChange = change;
-          ctx.ui.notify(`dev-loop: origin/${change} ${shortSha(remoteHead)} ahead of / diverged from local ${shortSha(localHead)}; stopping — resolve then /loop resume`, "error");
+      const r = await reconcileBranch(pi, s.repo, s.prNum, wtDir, change);
+      if (r.kind === "diverged") {
+        s.stopReason = "diverged"; interruptedChange = change;
+        ctx.ui.notify(`dev-loop: origin/${change} diverged from local; stopping — resolve then /loop resume`, "error");
+        persist(); return "stop";
+      }
+      if (r.kind === "sync_push_failed") {
+        s.stopReason = "sync_push_failed"; interruptedChange = change;
+        ctx.ui.notify(`dev-loop: sync push failed (${r.stderr}); stopping — fix then /loop resume`, "error");
+        persist(); return "stop";
+      }
+      if (r.kind === "main_conflict") {
+        // origin/main conflicts with this change — hand to an agent turn that
+        // resolves it with the change's openspec context, then re-review.
+        s.inner = REVIEW_INNER.RESOLVE_MAIN; persist(); return "cont";
+      }
+      if (r.kind === "main_merged_clean") {
+        // Clean main merge already committed by the helper — push it. The head
+        // changed, so clear triggerAt + reviewDeadline to force a fresh @codex
+        // review of the merged head (and avoid a spurious timeout on the next wake).
+        const { code, stderr } = await run(pi, "git", ["push"], wtDir);
+        if (code !== 0) {
+          s.stopReason = "push_failed"; interruptedChange = change;
+          ctx.ui.notify(`dev-loop: push of main merge failed (${stderr}); stopping — fix then /loop resume`, "error");
           persist(); return "stop";
         }
+        s.head = r.head; s.triggerAt = null; s.reviewDeadline = null;
+        ctx.ui.notify(`dev-loop: merged origin/main (clean) on round ${s.round}; re-triggering @codex review on the merged head`, "info");
+        s.inner = REVIEW_INNER.PROBE; persist(); return "cont";
       }
-      s.head = localHead;
+      // ok / synced: refresh head, probe.
+      s.head = r.head;
       s.inner = REVIEW_INNER.PROBE; persist(); return "cont";
+    }
+    if (s.inner === REVIEW_INNER.RESOLVE_MAIN) {
+      await resolveMainPhase(pi, ctx, change, wtDir);
+      if (stopRequested) {
+        s.stopReason = "stopped"; interruptedChange = change;
+        ctx.ui.notify(`dev-loop: stopped during main-merge resolution — PR + worktree left; use /loop resume`, "warning");
+        persist(); return "stop";
+      }
+      // Agent must have committed a clean merge. Guard: unmerged files left ⇒ stop.
+      const { stdout: unmerged } = await run(pi, "git", ["diff", "--name-only", "--diff-filter=U"], wtDir);
+      if (unmerged) {
+        s.stopReason = "main_conflict_unresolved"; interruptedChange = change;
+        ctx.ui.notify(`dev-loop: main-merge conflict not fully resolved (unmerged files remain); stopping — fix then /loop resume`, "error");
+        persist(); return "stop";
+      }
+      const { stdout: head } = await run(pi, "git", ["rev-parse", "HEAD"], wtDir);
+      // head changed → reset triggerAt + deadline so the next probe re-triggers
+      // a fresh @codex review; back to RECONCILE to push the resolution + continue.
+      s.head = head; s.triggerAt = null; s.reviewDeadline = null;
+      s.inner = REVIEW_INNER.RECONCILE; persist(); return "cont";
     }
     if (s.inner === REVIEW_INNER.PROBE) {
       const v = await readCodexVerdict(pi, s.repo, s.prNum, s.head, s.triggerAt);

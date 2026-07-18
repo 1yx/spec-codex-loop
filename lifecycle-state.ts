@@ -38,6 +38,7 @@ export const REVIEW_INNER = Object.freeze({
   PROBE: "review_probe",         // readCodexVerdict once (no side effects)
   TRIGGER: "review_trigger",     // post @codex review, record triggerAt + deadline
   FIX: "review_fix",             // fixPhase (agent turn), next round
+  RESOLVE_MAIN: "review_resolve_main", // agent resolves origin/main merge conflicts (context-aware), then re-review
 } as const);
 
 export type ReviewInner = (typeof REVIEW_INNER)[keyof typeof REVIEW_INNER];

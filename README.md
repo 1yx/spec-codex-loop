@@ -4,7 +4,7 @@ A [pi](https://pi.dev) extension that runs an **autonomous spec-driven PR loop**
 
 ## States
 
-12 个状态:`BUILD` 和 `REVIEW` 各携带 inner 子状态(各自落盘、可重入)。按流转顺序排列。
+13 个状态:`BUILD` 和 `REVIEW` 各携带 inner 子状态(各自落盘、可重入)。按流转顺序排列。
 
 | # | 状态 | 中文名 | 说明 |
 |---|------|--------|------|
@@ -13,15 +13,16 @@ A [pi](https://pi.dev) extension that runs an **autonomous spec-driven PR loop**
 | 3 | BUILD + IMPLEMENT | 实现 | agent: openspec-apply-change + 测试 + commit |
 | 4 | BUILD + PUSH | 推送 | git push -u origin <change>(幂等)|
 | 5 | BUILD + PR | 开 PR | gh pr create → 进入 REVIEW(已存在则跳过)|
-| 6 | REVIEW + RECONCILE | 协调 | fetch + 对齐 local/origin HEAD;睡眠/唤醒的恢复入口 |
-| 7 | REVIEW + PROBE | 探测 | 读一次 Codex verdict,纯查询无副作用 |
-| 8 | REVIEW + TRIGGER | 触发 | 发 @codex review,记 triggerAt + 截止时间 |
-| 9 | REVIEW + FIX | 修复 | agent 跑一轮,round++ |
-| 10 | ARCHIVE | 归档 | openspec archive + 标记 TODO [x] → 提交 → 推送 |
-| 11 | MERGE | 合并 | gh pr merge --squash --delete-branch |
-| 12 | CLEANUP | 清理 | 删 worktree + sync main(终态) |
+| 6 | REVIEW + RECONCILE | 协调 | fetch + 对齐 local/origin HEAD;睡眠/唤醒的恢复入口;origin/main 前进时检测(干净自动合 / 冲突转 #7)|
+| 7 | REVIEW + RESOLVE_MAIN | 解冲突 | origin/main 与本 change 冲突时,agent 带 openspec 上下文解冲突,commit |
+| 8 | REVIEW + PROBE | 探测 | 读一次 Codex verdict,纯查询无副作用 |
+| 9 | REVIEW + TRIGGER | 触发 | 发 @codex review,记 triggerAt + 截止时间 |
+| 10 | REVIEW + FIX | 修复 | agent 跑一轮,round++ |
+| 11 | ARCHIVE | 归档 | openspec archive + 标记 TODO [x] → 提交 → 推送 |
+| 12 | MERGE | 合并 | gh pr merge --squash --delete-branch |
+| 13 | CLEANUP | 清理 | 删 worktree + sync main(终态)|
 
-`.loop-state.json`(`.worktree/<change>/`)落盘:#3–12 都作为重入点持久化;#1–2 不写盘,崩了靠 `resolvePhase(reality)` 现场重推(worktree/PR/archived 状态)。CLEANUP 写一次后,合并完成即 `clearLoopState` 删文件。
+`.loop-state.json`(`.worktree/<change>/`)落盘:#3–13 都作为重入点持久化;#1–2 不写盘,崩了靠 `resolvePhase(reality)` 现场重推(worktree/PR/archived 状态)。CLEANUP 写一次后,合并完成即 `clearLoopState` 删文件。
 
 状态流转:
 
@@ -31,6 +32,7 @@ stateDiagram-v2
     state "BUILD + PUSH" as Bp
     state "BUILD + PR" as Br
     state "REVIEW + RECONCILE" as Rr
+    state "REVIEW + RESOLVE_MAIN" as Rm
     state "REVIEW + PROBE" as Rp
     state "REVIEW + TRIGGER" as Rt
     state "REVIEW + FIX" as Rf
@@ -42,7 +44,9 @@ stateDiagram-v2
     Bi --> Bp
     Bp --> Br
     Br --> Rr
-    Rr --> Rp
+    Rr --> Rp: ok / main merged clean
+    Rr --> Rm: origin/main conflict
+    Rm --> Rr: resolved (push + re-review)
     Rp --> Rt: no trigger yet
     Rp --> ARCHIVE: pass / no suggestions
     Rp --> Rf: suggestions
