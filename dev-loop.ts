@@ -916,6 +916,10 @@ async function oneStep(
           break;
         case "timeout":
           s.stopReason = "timeout"; interruptedChange = change;
+          // Clear triggerAt + deadline like quota/codex_error: otherwise every
+          // /loop resume re-enters RECONCILE, sees the elapsed deadline, and
+          // times out again instantly — a dead loop on a dead trigger.
+          s.triggerAt = null; s.reviewDeadline = null;
           ctx.ui.notify(`dev-loop: no Codex review after ${REVIEW_TOTAL_TIMEOUT_MS / 60000}min on round ${s.round}; stopping (PR + worktree left)`, "warning");
           persist(); return "stop";
         default:
@@ -1062,6 +1066,10 @@ async function oneStep(
         persist(); return "stop";
       }
       s.round++;
+      // Fresh deadline for the new head: Codex reviews the pushed commit (it
+      // auto-reviews pushes — verified ~8 min/commit), so give it a full window
+      // from now, not the stale deadline inherited from the original trigger.
+      s.reviewDeadline = Date.now() + REVIEW_TOTAL_TIMEOUT_MS;
       s.inner = REVIEW_INNER.RECONCILE; persist(); return "cont";
     }
     s.stopReason = "bad_state"; persist(); return "stop";
@@ -1321,6 +1329,14 @@ export default function (pi: ExtensionAPI) {
         runCtx = { ctx, change: ch, dryRun: false, all: false, oneOff: true };
         loopActive = true;
         stopRequested = false;
+        fetchRequested = false;
+        // Clear stale sentinels left by a touch while no loop was running —
+        // otherwise the ticker we're about to start consumes one and stops the
+        // resume at the next boundary. (runPrefix does this too, but a resume
+        // into REVIEW skips runPrefix.)
+        for (const s of [FETCH_SENTINEL, STOP_SENTINEL]) {
+          try { unlinkSync(join(ctx.cwd as string, s)); } catch { /* already gone */ }
+        }
         clearWaitTimer(ch);
         startSentinelTicker(ctx);
         await runLoopChain();
