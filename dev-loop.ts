@@ -648,22 +648,30 @@ async function fixPhase(
 }
 
 /** Review inner: origin/main advanced and conflicts with this change. The
- *  agent runs `git merge origin/main` (it conflicts) then resolves using the
- *  change's openspec context (design/specs/tasks) so the merge keeps the change's
- *  semantics — not a blind merge. Agent commits; the loop pushes. */
+ *  agent runs `git merge origin/main` (it conflicts) then resolves using BOTH
+ *  sides' context — the change's openspec intent AND what main changed — so it
+ *  doesn't sacrifice already-merged main code for this change. If a conflict
+ *  needs a human judgment call, the agent leaves it unmerged and stops (the
+ *  loop's unmerged-file guard terminates with `main_conflict_unresolved`). */
 async function resolveMainPhase(pi: ExtensionAPI, ctx: any, change: string, wtDir: string) {
   const prompt = [
     `origin/main advanced and conflicts with the "${change}" change in this worktree.`,
-    `First run \`git merge origin/main\` (it will conflict), then resolve honoring what this change is meant to do.`,
+    `First run \`git merge origin/main\` (it will conflict), then resolve honoring BOTH sides — don't sacrifice already-merged main code for this change.`,
     "",
     `Work inside the worktree (absolute paths; prefix shell with \`cd ${wtDir} &&\`): ${wtDir}`,
     "",
-    "Context for this change — read it to understand intent before resolving:",
-    `  openspec status --change "${change}" --json`,
-    `  openspec instructions apply --change "${change}" --json`,
-    "  Read the listed contextFiles (design.md / specs) so the merge preserves this change's semantics.",
+    "Understand BOTH sides before resolving:",
+    "- This change's intent:",
+    `    openspec status --change "${change}" --json`,
+    `    openspec instructions apply --change "${change}" --json`,
+    "    Read the listed contextFiles (design.md / specs) — preserve this change's semantics.",
+    "- What origin/main changed (already-merged, legitimate — do NOT revert it to serve this change):",
+    "    git log --oneline -15 origin/main",
+    "    git diff   # the conflicts; markers show 'ours' (this change) vs 'theirs' (main)",
     "",
-    "Then resolve every conflict (no unmerged files left), run tests, and commit the merge.",
+    "Resolve each conflict keeping both sides' intent where compatible. Run tests, then commit the merge.",
+    "If a conflict genuinely needs a human judgment call — resolving it would discard one side's legitimate",
+    "work — do NOT force it: leave that conflict unmerged and stop. The loop stops for manual review.",
     "Do NOT push — the loop pushes after.",
   ].join("\n");
   ctx.ui.notify(`dev-loop: resolving origin/main merge conflicts for ${change} (driving agent…)`, "info");
