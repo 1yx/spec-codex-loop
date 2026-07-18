@@ -116,7 +116,15 @@ touch .dev-loop-fetch  # same as /loop fetch
 touch .dev-loop-stop   # same as /loop stop
 ```
 
-The loop unlinks each sentinel as it consumes it, and clears stale ones at the start of every run. `Esc` aborts the current agent turn (build/fix) but does **not** reach the `review_wait` timer — use `/loop stop` for a reliable stop.
+Sentinel-file behavior (both live at the **repo root** — where `/loop` runs, not inside the worktree):
+
+- **Polled by a 1 s ticker that runs only while a loop is active** (started at run entry, stopped when it suspends or finishes). A `touch` with no loop running just sits on disk; it's reaped at the next run's start.
+- **One-shot.** The ticker `unlink`s each sentinel the instant it detects it, *then* applies the signal — so a single touch fires once, never repeatedly.
+- **`stop` wins over `fetch`.** If both files exist, the ticker checks `.dev-loop-stop` first (`else if`) and ignores `.dev-loop-fetch` until the next tick.
+- **Command path reuses the same files.** `/loop stop` / `/loop fetch` write the same sentinel (`writeControl`) and apply the signal immediately; the lingering file is then reaped by the ticker's next tick (or next-run stale cleanup if the loop already stopped).
+- **Never committed** — `ensureLocalIgnore` adds both to local gitignore.
+
+`Esc` aborts the current agent turn (build/fix) but does **not** reach the `review_wait` timer — use `/loop stop` for a reliable stop.
 
 > **Why this design.** pi serializes command dispatch behind a running command handler. An earlier version held the `/loop` handler open across the 10-min poll (`await sleep`), so every later input — including `/loop fetch` — queued until the loop finished. Splitting review into a persisted state machine that yields the handler at each wait is what makes live control possible.
 
