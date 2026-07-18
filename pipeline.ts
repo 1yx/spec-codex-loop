@@ -12,7 +12,7 @@ import {
   yieldTick,
   rt,
 } from "./runtime.ts";
-import type { LoopState } from "./runtime.ts";
+import type { LoopCtx, LoopState } from "./runtime.ts";
 import {
   copyEnvFiles,
   ensureLocalIgnore,
@@ -42,7 +42,7 @@ type PrefixResult =
  *  returns at the review/build boundary. */
 /** Create/reuse the change's worktree and seed it (env files, openspec, TODO).
  *  Returns "abort" if worktree creation or change lookup fails. */
-async function provisionWorktree(pi: ExtensionAPI, ctx: any, change: string, repoRoot: string, wtDir: string): Promise<"ok" | "abort"> {
+async function provisionWorktree(pi: ExtensionAPI, ctx: LoopCtx, change: string, repoRoot: string, wtDir: string): Promise<"ok" | "abort"> {
   if (!existsSync(wtDir)) {
     const { stderr: fetchErr, code: fetchCode } = await run(pi, "git", ["fetch", "origin", "main"], repoRoot);
     if (fetchCode !== 0) {
@@ -81,7 +81,7 @@ async function provisionWorktree(pi: ExtensionAPI, ctx: any, change: string, rep
 
 export async function runPrefix(
   pi: ExtensionAPI,
-  ctx: any,
+  ctx: LoopCtx,
   change: string,
   dryRun: boolean
 ): Promise<PrefixResult> {
@@ -132,7 +132,7 @@ export async function runPrefix(
 }
 
 // --- oneStep: per-phase handlers ----------------------------------------------
-async function handleBuild(pi: ExtensionAPI, ctx: any, change: string, s: LoopState, wtDir: string, persist: () => void): Promise<StepOutcome> {
+async function handleBuild(pi: ExtensionAPI, ctx: LoopCtx, change: string, s: LoopState, wtDir: string, persist: () => void): Promise<StepOutcome> {
   if (s.inner === BUILD_INNER.IMPLEMENT) {
     await buildImplement(pi, ctx, change, wtDir);
     if (rt.stopRequested) {
@@ -176,7 +176,7 @@ async function handleBuild(pi: ExtensionAPI, ctx: any, change: string, s: LoopSt
   s.stopReason = "bad_state"; persist(); return "stop";
 }
 
-async function handleReconcile(pi: ExtensionAPI, ctx: any, change: string, s: LoopState, wtDir: string, persist: () => void): Promise<StepOutcome> {
+async function handleReconcile(pi: ExtensionAPI, ctx: LoopCtx, change: string, s: LoopState, wtDir: string, persist: () => void): Promise<StepOutcome> {
   switch (waitAction(rt.fetchRequested, s.reviewDeadline, Date.now())) {
     case "recheck":
       rt.fetchRequested = false;
@@ -219,7 +219,7 @@ async function handleReconcile(pi: ExtensionAPI, ctx: any, change: string, s: Lo
   s.inner = REVIEW_INNER.PROBE; persist(); return "cont";
 }
 
-async function handleResolveMain(pi: ExtensionAPI, ctx: any, change: string, s: LoopState, wtDir: string, persist: () => void): Promise<StepOutcome> {
+async function handleResolveMain(pi: ExtensionAPI, ctx: LoopCtx, change: string, s: LoopState, wtDir: string, persist: () => void): Promise<StepOutcome> {
   await resolveMainPhase(pi, ctx, change, wtDir);
   if (rt.stopRequested) {
     s.stopReason = "stopped"; rt.interruptedChange = change;
@@ -237,7 +237,7 @@ async function handleResolveMain(pi: ExtensionAPI, ctx: any, change: string, s: 
   s.inner = REVIEW_INNER.RECONCILE; persist(); return "cont";
 }
 
-async function handleProbe(pi: ExtensionAPI, ctx: any, change: string, s: LoopState, persist: () => void): Promise<StepOutcome> {
+async function handleProbe(pi: ExtensionAPI, ctx: LoopCtx, change: string, s: LoopState, persist: () => void): Promise<StepOutcome> {
   const v = await readCodexVerdict(pi, s.repo, s.prNum, s.head, s.triggerAt);
   if (!v) {
     if (!s.triggerAt) { s.inner = REVIEW_INNER.TRIGGER; persist(); return "cont"; }
@@ -274,7 +274,7 @@ async function handleProbe(pi: ExtensionAPI, ctx: any, change: string, s: LoopSt
   s.inner = REVIEW_INNER.FIX; persist(); return "cont";
 }
 
-async function handleTrigger(pi: ExtensionAPI, ctx: any, s: LoopState, persist: () => void): Promise<StepOutcome> {
+async function handleTrigger(pi: ExtensionAPI, ctx: LoopCtx, s: LoopState, persist: () => void): Promise<StepOutcome> {
   const { code, stderr } = await run(pi, "gh", ["pr", "comment", String(s.prNum), "--body", "@codex review", "--repo", s.repo]);
   if (code !== 0) {
     s.stopReason = "trigger_failed";
@@ -288,7 +288,7 @@ async function handleTrigger(pi: ExtensionAPI, ctx: any, s: LoopState, persist: 
   persist(); return "cont";
 }
 
-async function handleFix(pi: ExtensionAPI, ctx: any, change: string, s: LoopState, wtDir: string, persist: () => void): Promise<StepOutcome> {
+async function handleFix(pi: ExtensionAPI, ctx: LoopCtx, change: string, s: LoopState, wtDir: string, persist: () => void): Promise<StepOutcome> {
   const { stdout: headPre } = await run(pi, "git", ["rev-parse", "HEAD"], wtDir);
   await fixPhase(pi, ctx, change, wtDir, s.prNum, s.round, s.suggestions);
   if (rt.stopRequested) {
@@ -313,7 +313,7 @@ async function handleFix(pi: ExtensionAPI, ctx: any, change: string, s: LoopStat
   s.inner = REVIEW_INNER.RECONCILE; persist(); return "cont";
 }
 
-async function handleReview(pi: ExtensionAPI, ctx: any, change: string, s: LoopState, wtDir: string, persist: () => void): Promise<StepOutcome> {
+async function handleReview(pi: ExtensionAPI, ctx: LoopCtx, change: string, s: LoopState, wtDir: string, persist: () => void): Promise<StepOutcome> {
   switch (s.inner) {
     case REVIEW_INNER.RECONCILE: return handleReconcile(pi, ctx, change, s, wtDir, persist);
     case REVIEW_INNER.RESOLVE_MAIN: return handleResolveMain(pi, ctx, change, s, wtDir, persist);
@@ -324,7 +324,7 @@ async function handleReview(pi: ExtensionAPI, ctx: any, change: string, s: LoopS
   }
 }
 
-async function handleArchive(pi: ExtensionAPI, ctx: any, change: string, s: LoopState, wtDir: string, persist: () => void): Promise<StepOutcome> {
+async function handleArchive(pi: ExtensionAPI, ctx: LoopCtx, change: string, s: LoopState, wtDir: string, persist: () => void): Promise<StepOutcome> {
   const wtChangeDir = join(wtDir, "openspec", "changes", change);
   if (existsSync(wtChangeDir)) {
     const { code, stderr } = await run(pi, "openspec", ["archive", change, "-y"], wtDir);
@@ -349,7 +349,7 @@ async function handleArchive(pi: ExtensionAPI, ctx: any, change: string, s: Loop
   s.phase = PHASE.MERGE; persist(); return "cont";
 }
 
-async function handleMerge(pi: ExtensionAPI, ctx: any, s: LoopState, persist: () => void): Promise<StepOutcome> {
+async function handleMerge(pi: ExtensionAPI, ctx: LoopCtx, s: LoopState, persist: () => void): Promise<StepOutcome> {
   const { code, stderr } = await run(pi, "gh", ["pr", "merge", String(s.prNum), "--squash", "--delete-branch", "--repo", s.repo]);
   if (code !== 0) {
     s.stopReason = "merge_failed";
@@ -359,14 +359,14 @@ async function handleMerge(pi: ExtensionAPI, ctx: any, s: LoopState, persist: ()
   s.phase = PHASE.CLEANUP; persist(); return "cont";
 }
 
-async function handleCleanup(pi: ExtensionAPI, ctx: any, change: string, s: LoopState, repoRoot: string): Promise<StepOutcome> {
+async function handleCleanup(pi: ExtensionAPI, ctx: LoopCtx, change: string, s: LoopState, repoRoot: string): Promise<StepOutcome> {
   await removeWorktree(pi, repoRoot, change);
   await syncMain(pi, ctx, repoRoot);
   return "done";
 }
 
 /** One state-machine transition. Mutates `s` and persists it. */
-export async function oneStep(pi: ExtensionAPI, ctx: any, change: string, s: LoopState): Promise<StepOutcome> {
+export async function oneStep(pi: ExtensionAPI, ctx: LoopCtx, change: string, s: LoopState): Promise<StepOutcome> {
   const repoRoot = ctx.cwd as string;
   const wtDir = join(repoRoot, WORKTREE_ROOT, change);
   const persist = () => writeLoopState(repoRoot, change, s);
@@ -381,7 +381,7 @@ export async function oneStep(pi: ExtensionAPI, ctx: any, change: string, s: Loo
 /** Drive one change from its persisted state to suspension or completion. */
 export async function driveChange(
   pi: ExtensionAPI,
-  ctx: any,
+  ctx: LoopCtx,
   change: string,
   dryRun: boolean,
   oneOff: boolean

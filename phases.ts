@@ -1,5 +1,5 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import type { Suggestion } from "./runtime.ts";
+import type { LoopCtx, Suggestion } from "./runtime.ts";
 import { POLL_TICK_MS, rt } from "./runtime.ts";
 import { run } from "./git-utils.ts";
 import { formatSuggestions } from "./codex.ts";
@@ -29,7 +29,7 @@ function driveAgent(pi: ExtensionAPI, prompt: string): Promise<void> {
 /** Build step 1 (agent turn): implement the OpenSpec change + tests green + commit.
  *  No push / PR here — those are separate persisted oneStep transitions, so a crash
  *  after this step won't re-run the creative implement work. */
-export async function buildImplement(pi: ExtensionAPI, ctx: any, change: string, wtDir: string): Promise<void> {
+export async function buildImplement(pi: ExtensionAPI, ctx: LoopCtx, change: string, wtDir: string): Promise<void> {
   const prompt = [
     `Implement the OpenSpec change "${change}" by following the openspec-apply-change skill.`,
     "",
@@ -52,7 +52,7 @@ export async function buildImplement(pi: ExtensionAPI, ctx: any, change: string,
 
 export async function fixPhase(
   pi: ExtensionAPI,
-  ctx: any,
+  ctx: LoopCtx,
   change: string,
   wtDir: string,
   prNum: number,
@@ -75,7 +75,7 @@ export async function fixPhase(
  *  context — the change's openspec intent AND what main changed — so it doesn't
  *  sacrifice already-merged main code. If a conflict needs a human judgment call,
  *  the agent leaves it unmerged and stops. */
-export async function resolveMainPhase(pi: ExtensionAPI, ctx: any, change: string, wtDir: string): Promise<void> {
+export async function resolveMainPhase(pi: ExtensionAPI, ctx: LoopCtx, change: string, wtDir: string): Promise<void> {
   const prompt = [
     `origin/main advanced and conflicts with the "${change}" change in this worktree.`,
     `First run \`git merge origin/main\` (it will conflict), then resolve honoring BOTH sides — don't sacrifice already-merged main code for this change.`,
@@ -101,7 +101,7 @@ export async function resolveMainPhase(pi: ExtensionAPI, ctx: any, change: strin
 }
 
 /** Precondition checks shared by the normal run and /loop resume. */
-export async function checkPreconditions(pi: ExtensionAPI, ctx: any): Promise<boolean> {
+export async function checkPreconditions(pi: ExtensionAPI, ctx: LoopCtx): Promise<boolean> {
   for (const cmd of ["git", "gh", "openspec"]) {
     const { code } = await run(pi, "sh", ["-c", `command -v ${cmd}`]);
     if (code !== 0) {

@@ -8,14 +8,14 @@ import {
   WORKTREE_ROOT,
   rt,
 } from "./runtime.ts";
-import type { LoopState } from "./runtime.ts";
+import type { LoopCtx, LoopState } from "./runtime.ts";
 
 /** Apply a control signal (fetch/stop). Sets the flag the chain checks, and — if
  *  a loop is running — cancels the review_wait timer and re-enters the chain
  *  (via rt.wakeLoop, so this module doesn't import the pipeline). With the
  *  non-blocking driver, /loop fetch|stop reach here in real time; sentinel files
  *  route through it too for cross-terminal use. */
-export function applyControl(ctx: any, kind: "fetch" | "stop"): void {
+export function applyControl(ctx: LoopCtx, kind: "fetch" | "stop"): void {
   if (kind === "fetch") rt.fetchRequested = true; else rt.stopRequested = true;
   ctx.ui.notify(
     kind === "stop" ? "dev-loop: stop requested — next safe boundary" : "dev-loop: fetch requested — rechecking now",
@@ -29,7 +29,7 @@ export function applyControl(ctx: any, kind: "fetch" | "stop"): void {
 }
 
 /** Command path: write the sentinel (cross-terminal trigger) then apply. */
-export function writeControl(ctx: any, sentinel: string, kind: "fetch" | "stop"): void {
+export function writeControl(ctx: LoopCtx, sentinel: string, kind: "fetch" | "stop"): void {
   try { writeFileSync(join(ctx.cwd as string, sentinel), ""); } catch { /* non-fatal */ }
   applyControl(ctx, kind);
 }
@@ -72,7 +72,7 @@ export function scheduleWait(ms: number): void {
 /** 1s ticker that turns a sentinel file (touched from any terminal) into a
  *  control signal — the cross-terminal path, since /loop fetch|stop only work
  *  inside the pi session. Runs only while a loop is active. */
-export function startSentinelTicker(ctx: any): void {
+export function startSentinelTicker(ctx: LoopCtx): void {
   stopSentinelTicker();
   rt.sentinelTicker = setInterval(() => {
     if (!rt.runCtx) return;

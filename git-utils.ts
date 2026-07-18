@@ -2,7 +2,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
 import { WORKTREE_ROOT } from "./runtime.ts";
-import type { ReconcileResult } from "./runtime.ts";
+import type { LoopCtx, ReconcileResult } from "./runtime.ts";
 
 /** Run a command via pi.exec, optionally in cwd; returns trimmed stdout + exit code. */
 export async function run(
@@ -11,7 +11,7 @@ export async function run(
   args: string[],
   cwd?: string
 ): Promise<{ stdout: string; stderr: string; code: number }> {
-  const r = await pi.exec(cmd, args, cwd ? { cwd } : undefined);
+  const r = await pi.exec(cmd, args, cwd ? { cwd } : undefined) as { stdout?: string; stderr?: string; code?: number };
   return {
     stdout: (r.stdout ?? "").trim(),
     stderr: (r.stderr ?? "").trim(),
@@ -157,7 +157,7 @@ export async function removeWorktree(pi: ExtensionAPI, repoRoot: string, change:
  *  working tree reflects the merged change. Confirms/switches to main first
  *  (best-effort). A local-only untracked TODO.md is dropped (lossless — the
  *  incoming copy is a superset). Non-fast-forwardable main warns. */
-export async function syncMain(pi: ExtensionAPI, ctx: any, repoRoot: string): Promise<void> {
+export async function syncMain(pi: ExtensionAPI, ctx: LoopCtx, repoRoot: string): Promise<void> {
   await run(pi, "git", ["fetch", "origin", "main"], repoRoot);
   const { stdout: branch } = await run(pi, "git", ["rev-parse", "--abbrev-ref", "HEAD"], repoRoot);
   if (branch !== "main") {

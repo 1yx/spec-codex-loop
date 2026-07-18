@@ -54,12 +54,20 @@ export type ReconcileResult =
   | { kind: "main_conflict" };
 
 export type RunCtx = {
-  ctx: any;
+  ctx: LoopCtx;
   change: string;
   dryRun: boolean;
   all: boolean;
   oneOff: boolean;
 };
+
+/** The slice of pi's ExtensionContext the loop actually uses (the full type lives
+ *  in the unresolvable-at-lint-time @earendil-works/pi-coding-agent package, so
+ *  we declare the minimal structural shape to avoid `any`). */
+export interface LoopCtx {
+  cwd: string;
+  ui: { notify(message: string, level?: "info" | "warning" | "error"): void };
+}
 
 // --- shared mutable runtime state (singleton; imported + mutated across modules) ---
 export const rt = {

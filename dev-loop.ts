@@ -2,7 +2,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { existsSync, readdirSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { FETCH_SENTINEL, STOP_SENTINEL, WORKTREE_ROOT, rt } from "./runtime.ts";
-import type { LoopState } from "./runtime.ts";
+import type { LoopCtx, LoopState } from "./runtime.ts";
 import { ensureLocalIgnore, findTodoFile, pickTask, removeFromLocalIgnore, run } from "./git-utils.ts";
 import { clearWaitTimer, readLoopState, startSentinelTicker, writeControl } from "./control.ts";
 import { shortSha } from "./codex.ts";
@@ -10,7 +10,7 @@ import { checkPreconditions } from "./phases.ts";
 import { runLoopChain } from "./pipeline.ts";
 
 // --- project init (/loop init) ------------------------------------------------
-async function initProject(pi: ExtensionAPI, ctx: any): Promise<void> {
+async function initProject(pi: ExtensionAPI, ctx: LoopCtx): Promise<void> {
   const cwd = ctx.cwd as string;
   const todoPath = findTodoFile(cwd) ?? join(cwd, "TODO.md");
   if (existsSync(todoPath)) {
@@ -45,7 +45,7 @@ async function initProject(pi: ExtensionAPI, ctx: any): Promise<void> {
 /** Read-only snapshot of every persisted loop state. Scans disk (not the
  *  in-memory interruptedChange) so it still finds a change left stuck by a
  *  crash/restart — which is the whole reason stopReason is persisted. */
-async function handleStatus(ctx: any): Promise<void> {
+async function handleStatus(ctx: LoopCtx): Promise<void> {
   const cwd = ctx.cwd as string;
   const wtRoot = join(cwd, WORKTREE_ROOT);
   const found: { change: string; s: LoopState }[] = [];
@@ -72,7 +72,7 @@ async function handleStatus(ctx: any): Promise<void> {
   }
 }
 
-async function handleResume(pi: ExtensionAPI, ctx: any): Promise<void> {
+async function handleResume(pi: ExtensionAPI, ctx: LoopCtx): Promise<void> {
   if (!rt.interruptedChange) {
     ctx.ui.notify("dev-loop: nothing to resume (no change stopped via /loop stop)", "warning");
     return;
@@ -94,7 +94,7 @@ async function handleResume(pi: ExtensionAPI, ctx: any): Promise<void> {
 }
 
 /** Normal run: /loop [change] [--dry-run] [--all]. */
-async function handleNormalRun(pi: ExtensionAPI, ctx: any, tokens: string[]): Promise<void> {
+async function handleNormalRun(pi: ExtensionAPI, ctx: LoopCtx, tokens: string[]): Promise<void> {
   const dryRun = tokens.includes("--dry-run");
   const all = tokens.includes("--all");
   const positional = tokens.filter((t) => !t.startsWith("--"));
@@ -124,7 +124,7 @@ async function handleNormalRun(pi: ExtensionAPI, ctx: any, tokens: string[]): Pr
   await runLoopChain();
 }
 
-async function loopCommandHandler(pi: ExtensionAPI, args: any, ctx: any): Promise<void> {
+async function loopCommandHandler(pi: ExtensionAPI, args: unknown, ctx: LoopCtx): Promise<void> {
   const tokens = String(args ?? "").trim().split(/\s+/).filter(Boolean);
   const sub = tokens[0];
   if (sub === "init") return initProject(pi, ctx);
@@ -149,7 +149,7 @@ export default function (pi: ExtensionAPI): void {
   // loopActive is true across a whole run, including the suspended review_wait
   // window (handler returned, pi back at its prompt). Free-text reaches this
   // event there; during an active agent turn it queues instead.
-  pi.on("input", async (event, ctx) => {
+  pi.on("input", async (event: { source: string }, ctx: LoopCtx) => {
     if (rt.loopActive && event.source === "interactive") {
       ctx.ui.notify("dev-loop is running — use /loop fetch | /loop stop (or touch .dev-loop-fetch / .dev-loop-stop); free-text is ignored", "info");
       return { action: "handled" };
@@ -160,6 +160,6 @@ export default function (pi: ExtensionAPI): void {
   pi.registerCommand("loop", {
     description:
       "Autonomous OpenSpec-change → worktree → PR → Codex review → archive → merge loop. Subcommands: stop | fetch | resume | status. Flags: --dry-run --all",
-    handler: (args, ctx) => loopCommandHandler(pi, args, ctx),
+    handler: (args: unknown, ctx: LoopCtx) => loopCommandHandler(pi, args, ctx),
   });
 }
