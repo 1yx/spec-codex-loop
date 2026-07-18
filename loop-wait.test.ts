@@ -1,6 +1,6 @@
 // Unit tests for the review WAIT-step decision (pure). Run: node loop-wait.test.ts
 import assert from "node:assert/strict";
-import { waitAction } from "./dev-loop.ts";
+import { waitAction } from "./control.ts";
 
 let passed = 0;
 const check = (name: string, cond: boolean) => { assert.ok(cond, name); passed++; console.log(`  ✓ ${name}`); };
