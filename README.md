@@ -17,12 +17,14 @@ A [pi](https://pi.dev) extension that runs an **autonomous spec-driven PR loop**
 | 7 | REVIEW + RESOLVE_MAIN | 解冲突 | origin/main 与本 change 冲突时,agent 带 openspec 上下文解冲突,commit |
 | 8 | REVIEW + PROBE | 探测 | 读一次 Codex verdict,纯查询无副作用 |
 | 9 | REVIEW + TRIGGER | 触发 | 发 @codex review,记 triggerAt + 截止时间 |
-| 10 | REVIEW + FIX | 修复 | agent 跑一轮,round++ |
+| 10 | REVIEW + FIX | 修复 | agent 跑一轮,round++,**重置 review 截止时间**(给新 head 新鲜窗口,不继承触发时的 deadline)|
 | 11 | ARCHIVE | 归档 | openspec archive + 标记 TODO [x] → 提交 → 推送 |
 | 12 | MERGE | 合并 | gh pr merge --squash --delete-branch |
 | 13 | CLEANUP | 清理 | 删 worktree + sync main(终态)|
 
 `.loop-state.json`(`.worktree/<change>/`)落盘:#3–13 都作为重入点持久化;#1–2 不写盘,崩了靠 `resolvePhase(reality)` 现场重推(worktree/PR/archived 状态)。CLEANUP 写一次后,合并完成即 `clearLoopState` 删文件。
+
+任意 REVIEW 状态 stop(timeout / quota / codex_error / diverged / push 失败)都清 `triggerAt`+`reviewDeadline` 并留 PR+worktree,所以 `/loop resume` 会重触发 `@codex review`,不在陈旧触发上死循环。
 
 状态流转:
 
@@ -52,37 +54,11 @@ stateDiagram-v2
     Rp --> Rf: suggestions
     Rp --> Rr: no verdict (sleep)
     Rt --> Rp
-    Rf --> Rr: round++
+    Rf --> Rr: round++ (fresh deadline)
     ARCHIVE --> MERGE
     MERGE --> CLEANUP
     CLEANUP --> [*]
 ```
-
-## Flow
-
-```
-TODO.md `- [ ] <change>`  →  worktree .worktree/<change> on branch <change>
-   →  openspec-apply-change (implement + tests) → commit → push → gh pr create
-   →  @codex review  →  fix per suggestions → push  (repeat until pass / repeat)
-   →  openspec archive + mark `- [x]` + commit  →  gh pr merge --squash  →  remove worktree  →  sync main
-```
-
-The outer loop is deterministic TypeScript; the fuzzy work (implement, address review) is delegated to pi's agent loop, one bounded turn per step, scoped to the worktree.
-
-## Codex review signal contract
-
-Codex exposes no reliable review state (`state` is always `COMMENTED`) — the signal lives in what the bot posts. Bot login prefix: `chatgpt-codex-connector`.
-
-| Signal | Form | Verdict |
-|---|---|---|
-| **Pass** | PR comment: `Didn't find any major issues` + `Reviewed commit: <sha>` | → merge |
-| **Fail** | review (`commit_id` = head) + inline comments | → fix each (fed to the agent) |
-| **Quota** | PR comment: `usage limits… for code reviews` | → stop (`quota`); `/loop resume` re-triggers after reset |
-| **Bot error** | any other post-trigger comment (e.g. "Something went wrong"; does not auto-retry) | → stop (`codex_error`); `/loop resume` re-triggers |
-
-Each inline comment is `![P1/P2/P3 Badge] … **<title>** <detail>` with `path` / `line`.
-
-**Key invariants.** Verdicts (pass/fail) are keyed on the HEAD commit, not wall-clock — so a stop/resume reuses a verdict already given (pass takes precedence over a later fail for the same commit). Quota and bot-error are gated on `triggerAt` (the timestamp of our `@codex review`), and both stops **clear `triggerAt`**: that breaks the dead loop (the transient comment never leaves the PR), lets a newer verdict through, and makes resume re-trigger. Inline comments are scoped by `pull_request_review_id` (their own `commit_id` is unreliable on a real PR).
 
 ## Install
 
@@ -116,24 +92,6 @@ Then `/reload` inside pi (or restart) to pick it up.
 /loop status           Show every persisted state: phase/inner, round, PR, stop reason
 ```
 
-### Control during a run
-
-`/loop stop` / `/loop fetch` work in real time mid-run: the `/loop` handler returns at each `review_wait` (the only long wait), persisting state + scheduling a 10-min re-probe, so pi is back at its prompt and the next command dispatches within ~1 s.
-
-```bash
-/loop fetch            # re-check Codex now
-/loop stop             # stop at the next safe boundary (PR + worktree kept)
-```
-
-From **another terminal**, the same signals work via sentinel files (polled 1×/s at the repo root):
-
-```bash
-touch .dev-loop-fetch  # = /loop fetch
-touch .dev-loop-stop   # = /loop stop
-```
-
-Each sentinel is `unlink`ed the moment it's detected (one-shot). If both exist, `stop` wins. Polled only while a loop is active — a stray touch is reaped at the next run's start. `/loop stop` / `fetch` write the same files. `Esc` aborts the current agent turn but doesn't reach `review_wait` — use `/loop stop`.
-
 ### First-time setup
 
 `/loop init` (idempotent) creates `TODO.md` (tracked — its `- [x]` flips ride each PR), adds `.worktree/` to local gitignore, and runs `openspec init --tools pi`.
@@ -152,38 +110,6 @@ Each must exist under `openspec/changes/`. On merge the line flips to `- [x]`.
 ### Why a separate `TODO.md`
 
 OpenSpec knows what's done (`archive`), but change names can't carry ordering — `validateChangeName` requires a leading lowercase letter, and `openspec list` only sorts by recent/name. `TODO.md` is the sequencing layer (line order); the change name stays a clean identifier (the "what").
-
-## Preconditions
-
-- `git`, `gh` (authenticated), `openspec` on `PATH`
-- `openspec/` at the repo root (`/loop init` scaffolds it) + each TODO change under `openspec/changes/`
-- Default branch `main`; `origin` → your repo
-- If `openspec/` isn't on `origin/main` (git-ignored / uncommitted), it's copied into the worktree untracked
-
-## Behavior & guardrails
-
-- **Worktree per change.** `git worktree add .worktree/<change> -b <change> origin/main`; all agent work scoped to it.
-- **Archive before merge.** On pass, `openspec archive` folds specs + moves the change to `archive/`, committed to the PR branch, then squash-merged.
-- **Resumable.** Re-running detects worktree + PR state (none/open/merged) + archived-ness, skips done stages, continues. A merged-but-uncleaned change just gets torn down.
-- **Fixes until pass or stop.** Unbounded review→fix rounds until Codex passes, or a stop fires: quota, bot error, `/loop stop`, no review after the wait, no agent progress, or a repeating review. `/loop status` shows every state + stop reason.
-- **Merges automatically** on pass (no confirmation). On any failure, PR + worktree are left for inspection.
-
-## Architecture
-
-- `lifecycle-state.ts` — pure phase model (`PHASE`, `REVIEW_INNER`, `BUILD_INNER`, transition graph, `resolvePhase`); no I/O, unit-tested.
-- `runPrefix` — resolve → provision, then hands off to BUILD.
-- `oneStep` — one persisted transition: BUILD inner (implement→push→pr), REVIEW inner (reconcile→probe→trigger→fix, sleeping as reconcile), or archive→merge→cleanup.
-- `driveChange` / `runLoopChain` — re-entrant driver; persists to `.worktree/<change>/.loop-state.json` so any stop/resume/crash re-enters at the exact state.
-- `readCodexVerdict` — reads the verdict for HEAD (pass comment / fail review+inline / quota / unclassified).
-- `buildImplement` / `fixPhase` — agent turns scoped to the worktree.
-- Helpers: `findTodoFile` / `pickTask` / `markDone` (TODO parse+flip), `ensureLocalIgnore` / `removeWorktree` / `prStateFor`, `driveAgent`.
-
-## Not included (add when needed)
-
-- A separate skill file for per-step prompts (currently constants in `dev-loop.ts`).
-- The 👍-reaction pass path (the "Didn't find any major issues" comment covers the observed case).
-- Severity-based filtering (all suggestions are addressed; ignore P3 if you want).
-- Strict per-artifact OpenSpec gating (proposal / specs / design / tasks) — the agent currently decides artifact depth.
 
 ## License
 
