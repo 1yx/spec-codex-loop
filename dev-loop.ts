@@ -1,8 +1,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { existsSync, readdirSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { FETCH_SENTINEL, STOP_SENTINEL, WORKTREE_ROOT, rt } from "./runtime.ts";
-import type { LoopCtx, LoopState } from "./runtime.ts";
+import { FETCH_SENTINEL, STOP_SENTINEL, WORKTREE_ROOT, rt, type LoopCtx, type LoopState } from "./runtime.ts";
 import { ensureLocalIgnore, findTodoFile, pickTask, removeFromLocalIgnore, run } from "./git-utils.ts";
 import { clearWaitTimer, readLoopState, startSentinelTicker, writeControl } from "./control.ts";
 import { shortSha } from "./codex.ts";
@@ -35,9 +34,9 @@ async function initProject(pi: ExtensionAPI, ctx: LoopCtx): Promise<void> {
   if (existsSync(join(cwd, "openspec"))) {
     ctx.ui.notify("dev-loop: openspec/ already present", "info");
   } else {
-    const { code, stderr } = await run(pi, "openspec", ["init", "--tools", "pi"]);
-    if (code === 0) ctx.ui.notify("dev-loop: ran `openspec init --tools pi`", "info");
-    else ctx.ui.notify(`dev-loop: openspec init failed: ${stderr}`, "error");
+    const { code, stderr } = await run(pi, ["openspec", "init", "--tools", "pi"]);
+    if (code === 0) {ctx.ui.notify("dev-loop: ran `openspec init --tools pi`", "info");}
+    else {ctx.ui.notify(`dev-loop: openspec init failed: ${stderr}`, "error");}
   }
 }
 
@@ -45,31 +44,33 @@ async function initProject(pi: ExtensionAPI, ctx: LoopCtx): Promise<void> {
 /** Read-only snapshot of every persisted loop state. Scans disk (not the
  *  in-memory interruptedChange) so it still finds a change left stuck by a
  *  crash/restart — which is the whole reason stopReason is persisted. */
+function notifyStatusEntry(ctx: LoopCtx, change: string, s: LoopState): void {
+  const running = rt.loopActive && rt.runCtx?.change === change;
+  const tag = running ? "RUNNING" : s.stopReason ? `STOPPED (${s.stopReason})` : "idle";
+  ctx.ui.notify(
+    `dev-loop: "${change}" — ${tag}\n` +
+    `  phase ${s.phase}${s.inner ? ` / inner ${s.inner}` : ""} · round ${s.round}\n` +
+    `  PR #${s.prNum} @ ${shortSha(s.head)} (${s.repo})`,
+    running ? "info" : s.stopReason ? "warning" : "info",
+  );
+}
+
 async function handleStatus(ctx: LoopCtx): Promise<void> {
   const cwd = ctx.cwd as string;
   const wtRoot = join(cwd, WORKTREE_ROOT);
   const found: { change: string; s: LoopState }[] = [];
   if (existsSync(wtRoot)) {
     for (const d of readdirSync(wtRoot, { withFileTypes: true })) {
-      if (!d.isDirectory()) continue;
+      if (!d.isDirectory()) {continue;}
       const s = readLoopState(cwd, d.name);
-      if (s) found.push({ change: d.name, s });
+      if (s) {found.push({ change: d.name, s });}
     }
   }
   if (!found.length) {
     ctx.ui.notify("dev-loop: no loop state — nothing running, nothing stopped", "info");
     return;
   }
-  for (const { change, s } of found) {
-    const running = rt.loopActive && rt.runCtx?.change === change;
-    const tag = running ? "RUNNING" : s.stopReason ? `STOPPED (${s.stopReason})` : "idle";
-    ctx.ui.notify(
-      `dev-loop: "${change}" — ${tag}\n` +
-      `  phase ${s.phase}${s.inner ? ` / inner ${s.inner}` : ""} · round ${s.round}\n` +
-      `  PR #${s.prNum} @ ${shortSha(s.head)} (${s.repo})`,
-      running ? "info" : s.stopReason ? "warning" : "info",
-    );
-  }
+  for (const { change, s } of found) {notifyStatusEntry(ctx, change, s);}
 }
 
 async function handleResume(pi: ExtensionAPI, ctx: LoopCtx): Promise<void> {
@@ -77,7 +78,7 @@ async function handleResume(pi: ExtensionAPI, ctx: LoopCtx): Promise<void> {
     ctx.ui.notify("dev-loop: nothing to resume (no change stopped via /loop stop)", "warning");
     return;
   }
-  if (!(await checkPreconditions(pi, ctx))) return;
+  if (!(await checkPreconditions(pi, ctx))) {return;}
   const ch = rt.interruptedChange;
   ctx.ui.notify(`dev-loop: resuming "${ch}"`, "info");
   rt.runCtx = { ctx, change: ch, dryRun: false, all: false, oneOff: true };
@@ -100,7 +101,7 @@ async function handleNormalRun(pi: ExtensionAPI, ctx: LoopCtx, tokens: string[])
   const positional = tokens.filter((t) => !t.startsWith("--"));
   const oneOff = positional.join(" ").trim();
   const cwd = ctx.cwd as string;
-  if (!(await checkPreconditions(pi, ctx))) return;
+  if (!(await checkPreconditions(pi, ctx))) {return;}
   let firstChange: string | null = null;
   if (oneOff) {
     if (!existsSync(join(cwd, "openspec", "changes", oneOff))) {
@@ -127,11 +128,11 @@ async function handleNormalRun(pi: ExtensionAPI, ctx: LoopCtx, tokens: string[])
 async function loopCommandHandler(pi: ExtensionAPI, args: unknown, ctx: LoopCtx): Promise<void> {
   const tokens = String(args ?? "").trim().split(/\s+/).filter(Boolean);
   const sub = tokens[0];
-  if (sub === "init") return initProject(pi, ctx);
-  if (sub === "stop") return writeControl(ctx, STOP_SENTINEL, "stop");
-  if (sub === "fetch") return writeControl(ctx, FETCH_SENTINEL, "fetch");
-  if (sub === "status") return handleStatus(ctx);
-  if (sub === "resume") return handleResume(pi, ctx);
+  if (sub === "init") {return initProject(pi, ctx);}
+  if (sub === "stop") {return writeControl(ctx, STOP_SENTINEL, "stop");}
+  if (sub === "fetch") {return writeControl(ctx, FETCH_SENTINEL, "fetch");}
+  if (sub === "status") {return handleStatus(ctx);}
+  if (sub === "resume") {return handleResume(pi, ctx);}
   return handleNormalRun(pi, ctx, tokens);
 }
 

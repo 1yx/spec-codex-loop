@@ -69,7 +69,7 @@ export const OUTER_TRANSITIONS: Readonly<Record<Phase, readonly Phase[]>> = Obje
 
 export const TERMINAL_PHASES: readonly Phase[] = Object.freeze([PHASE.CLEANUP]);
 
-export interface RealityProbes {
+export type RealityProbes = {
   /** Explicit phase override (e.g. read from .loop-state.json). Unknown → ignore. */
   phase?: string | null;
   /** Does the worktree .worktree/<change> exist? */
@@ -80,7 +80,7 @@ export interface RealityProbes {
   archived: boolean;
 }
 
-export interface ResolveResult {
+export type ResolveResult = {
   phase: Phase;
   allowedTransitions: readonly Phase[];
   isTerminal: boolean;
@@ -101,14 +101,14 @@ export interface ResolveResult {
 export function resolvePhase(input: RealityProbes): ResolveResult {
   const { phase = null, wtExists, prState, archived } = input;
 
-  if (phase !== null && phase !== undefined) {
-    if (PHASE_SET.has(phase)) return buildResult(phase as Phase);
+  if (phase) {
+    if (PHASE_SET.has(phase)) {return buildResult(phase as Phase);}
     // unrecognized explicit phase: fall through to inference
   }
-  if (prState === "merged") return buildResult(PHASE.CLEANUP);
-  if (!wtExists) return buildResult(PHASE.PROVISION);
-  if (prState === "open") return buildResult(archived ? PHASE.MERGE : PHASE.REVIEW);
-  if (prState === "none" && wtExists) return buildResult(PHASE.BUILD);
+  if (prState === "merged") {return buildResult(PHASE.CLEANUP);}
+  if (!wtExists) {return buildResult(PHASE.PROVISION);}
+  if (prState === "open") {return buildResult(archived ? PHASE.MERGE : PHASE.REVIEW);}
+  if (prState === "none") {return buildResult(PHASE.BUILD);}
   return buildResult(PHASE.PROVISION);
 }
 

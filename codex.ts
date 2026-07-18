@@ -10,13 +10,13 @@ const PASS_RE = /Didn't find any major issues/i;
 //   "Code review usage limits reached"
 const QUOTA_RE = /usage limits? for code reviews|code review usage limits? reached/i;
 
-interface GhComment {
+type GhComment = {
   id: number;
   user?: { login: string };
   created_at: string;
   body: string;
 }
-interface GhReview {
+type GhReview = {
   id?: number;
   user?: { login: string };
   state: string;
@@ -24,12 +24,12 @@ interface GhReview {
   commit_id?: string;
   body?: string;
 }
-interface GhInlineComment extends GhComment {
+type GhInlineComment = {
   pull_request_review_id?: number;
   path?: string;
   line?: number | null;
   commit_id?: string;
-}
+} & GhComment
 
 export function isCodex(login?: string): boolean {
   return !!login && login.startsWith(CODEX_LOGIN);
@@ -95,11 +95,9 @@ export async function latestCommentAt(pi: ExtensionAPI, repo: string, prNum: num
  *  already-passed commit is noise). Quota and bot-error are gated on triggerAt. */
 export async function readCodexVerdict(
   pi: ExtensionAPI,
-  repo: string,
-  prNum: number,
-  head: string,
-  triggerAt: string | null
+  v: { repo: string; prNum: number; head: string; triggerAt: string | null }
 ): Promise<PollResult | null> {
+  const { repo, prNum, head, triggerAt } = v;
   const head7 = shortSha(head);
   const issueComments =
     (await ghJson<GhComment[]>(pi, `repos/${repo}/issues/${prNum}/comments?per_page=100`)) ?? [];

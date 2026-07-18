@@ -7,8 +7,9 @@ import {
   STOP_SENTINEL,
   WORKTREE_ROOT,
   rt,
+  type LoopCtx,
+  type LoopState,
 } from "./runtime.ts";
-import type { LoopCtx, LoopState } from "./runtime.ts";
 
 /** Apply a control signal (fetch/stop). Sets the flag the chain checks, and — if
  *  a loop is running — cancels the review_wait timer and re-enters the chain
@@ -16,16 +17,16 @@ import type { LoopCtx, LoopState } from "./runtime.ts";
  *  non-blocking driver, /loop fetch|stop reach here in real time; sentinel files
  *  route through it too for cross-terminal use. */
 export function applyControl(ctx: LoopCtx, kind: "fetch" | "stop"): void {
-  if (kind === "fetch") rt.fetchRequested = true; else rt.stopRequested = true;
+  if (kind === "fetch") {rt.fetchRequested = true;} else {rt.stopRequested = true;}
   ctx.ui.notify(
     kind === "stop" ? "dev-loop: stop requested — next safe boundary" : "dev-loop: fetch requested — rechecking now",
     kind === "stop" ? "warning" : "info",
   );
-  if (!rt.runCtx) return;
+  if (!rt.runCtx) {return;}
   // Both signals must wake a suspended loop: fetch to re-probe, stop to reach the
   // terminal branch. Clearing the wait timer removes the only other wake source.
   clearWaitTimer(rt.runCtx.change);
-  if (!rt.stepping) rt.wakeLoop?.();
+  if (!rt.stepping) {void rt.wakeLoop?.();}
 }
 
 /** Command path: write the sentinel (cross-terminal trigger) then apply. */
@@ -41,7 +42,7 @@ export function statePath(repoRoot: string, change: string): string {
 export function readLoopState(repoRoot: string, change: string): LoopState | null {
   try {
     const p = statePath(repoRoot, change);
-    if (!existsSync(p)) return null;
+    if (!existsSync(p)) {return null;}
     return JSON.parse(readFileSync(p, "utf-8")) as LoopState;
   } catch { return null; }
 }
@@ -60,10 +61,10 @@ export function clearWaitTimer(change: string): void {
   if (t) { clearTimeout(t); rt.waitTimers.delete(change); }
 }
 export function scheduleWait(ms: number): void {
-  if (!rt.runCtx) return;
+  if (!rt.runCtx) {return;}
   const change = rt.runCtx.change;
   clearWaitTimer(change);
-  const t = setTimeout(() => { rt.wakeLoop?.(); }, ms);
+  const t = setTimeout(() => { void rt.wakeLoop?.(); }, ms);
   t.unref?.();
   rt.waitTimers.set(change, t);
 }
@@ -75,7 +76,7 @@ export function scheduleWait(ms: number): void {
 export function startSentinelTicker(ctx: LoopCtx): void {
   stopSentinelTicker();
   rt.sentinelTicker = setInterval(() => {
-    if (!rt.runCtx) return;
+    if (!rt.runCtx) {return;}
     const root = ctx.cwd as string;
     const stopP = join(root, STOP_SENTINEL);
     const fetchP = join(root, FETCH_SENTINEL);
@@ -93,7 +94,7 @@ export function stopSentinelTicker(): void {
  *  explicit "recheck now" always re-probes, even if the cap elapsed, instead of
  *  timing out. */
 export function waitAction(fetchRequested: boolean, reviewDeadline: number | null, now: number): "recheck" | "timeout" | "wait" {
-  if (fetchRequested) return "recheck";
-  if (reviewDeadline !== null && now > reviewDeadline) return "timeout";
+  if (fetchRequested) {return "recheck";}
+  if (reviewDeadline !== null && now > reviewDeadline) {return "timeout";}
   return "wait";
 }

@@ -10,7 +10,7 @@ export const REVIEW_WAIT_MS = 10 * 60_000; // poll interval between Codex fetche
 export const REVIEW_TOTAL_TIMEOUT_MS = 30 * 60_000; // cap per round
 
 // --- cross-cutting types ------------------------------------------------------
-export interface Suggestion {
+export type Suggestion = {
   severity: string | null;
   title: string;
   body: string;
@@ -18,7 +18,7 @@ export interface Suggestion {
   line: number | null;
 }
 
-export interface PollResult {
+export type PollResult = {
   pass: boolean;
   timeout: boolean;
   stopped: boolean;
@@ -31,7 +31,7 @@ export interface PollResult {
   suggestions: Suggestion[];
 }
 
-export interface LoopState {
+export type LoopState = {
   phase: string;
   inner: string | null;
   round: number;
@@ -64,10 +64,25 @@ export type RunCtx = {
 /** The slice of pi's ExtensionContext the loop actually uses (the full type lives
  *  in the unresolvable-at-lint-time @earendil-works/pi-coding-agent package, so
  *  we declare the minimal structural shape to avoid `any`). */
-export interface LoopCtx {
+export type LoopCtx = {
   cwd: string;
   ui: { notify(message: string, level?: "info" | "warning" | "error"): void };
 }
+
+/** Bundle of "what an agent phase operates on" — keeps function signatures
+ *  under the lint param cap without threading pi/ctx/change/wtDir separately. */
+export type PhaseCtx = {
+  pi: ExtensionAPI;
+  ctx: LoopCtx;
+  change: string;
+  wtDir: string;
+}
+
+/** oneStep handler context: a PhaseCtx plus the persisted state + persist fn. */
+export type StepCtx = {
+  s: LoopState;
+  persist: () => void;
+} & PhaseCtx
 
 // --- shared mutable runtime state (singleton; imported + mutated across modules) ---
 export const rt = {
@@ -83,7 +98,7 @@ export const rt = {
   turnResolve: null as (() => void) | null,
   /** Loop wake callback (set by the entry; control/timer trigger it without
    *  importing the pipeline, avoiding a control↔pipeline import cycle). */
-  wakeLoop: null as (() => void) | null,
+  wakeLoop: null as (() => void | Promise<void>) | null,
 };
 
 export const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));

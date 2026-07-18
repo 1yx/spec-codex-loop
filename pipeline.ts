@@ -11,8 +11,11 @@ import {
   WORKTREE_ROOT,
   yieldTick,
   rt,
+  type LoopCtx,
+  type LoopState,
+  type PhaseCtx,
+  type StepCtx,
 } from "./runtime.ts";
-import type { LoopCtx, LoopState } from "./runtime.ts";
 import {
   copyEnvFiles,
   ensureLocalIgnore,
@@ -38,18 +41,18 @@ type PrefixResult =
   | { kind: "abort" }
   | { kind: "dryRun" };
 
-/** Resolve → provision (worktree + env + openspec). Never blocks on a poll;
- *  returns at the review/build boundary. */
 /** Create/reuse the change's worktree and seed it (env files, openspec, TODO).
  *  Returns "abort" if worktree creation or change lookup fails. */
-async function provisionWorktree(pi: ExtensionAPI, ctx: LoopCtx, change: string, repoRoot: string, wtDir: string): Promise<"ok" | "abort"> {
+async function provisionWorktree(p: PhaseCtx): Promise<"ok" | "abort"> {
+  const { pi, ctx, change, wtDir } = p;
+  const repoRoot = ctx.cwd;
   if (!existsSync(wtDir)) {
-    const { stderr: fetchErr, code: fetchCode } = await run(pi, "git", ["fetch", "origin", "main"], repoRoot);
+    const { stderr: fetchErr, code: fetchCode } = await run(pi, ["git", "fetch", "origin", "main"], repoRoot);
     if (fetchCode !== 0) {
       ctx.ui.notify(`dev-loop: git fetch origin main failed: ${fetchErr}`, "error");
       return "abort";
     }
-    const { stderr: wtErr, code: wtCode } = await run(pi, "git", ["worktree", "add", "-b", change, wtDir, "origin/main"], repoRoot);
+    const { stderr: wtErr, code: wtCode } = await run(pi, ["git", "worktree", "add", "-b", change, wtDir, "origin/main"], repoRoot);
     if (wtCode !== 0) {
       ctx.ui.notify(`dev-loop: git worktree add failed: ${wtErr}`, "error");
       return "abort";
@@ -58,7 +61,7 @@ async function provisionWorktree(pi: ExtensionAPI, ctx: LoopCtx, change: string,
     ctx.ui.notify(`dev-loop: resuming — reusing worktree ${wtDir}`, "info");
   }
   const envCopied = copyEnvFiles(repoRoot, wtDir);
-  if (envCopied) ctx.ui.notify(`dev-loop: copied ${envCopied} env file(s) (.env*) into worktree`, "info");
+  if (envCopied) {ctx.ui.notify(`dev-loop: copied ${envCopied} env file(s) (.env*) into worktree`, "info");}
   const wtChangeDir = join(wtDir, "openspec", "changes", change);
   if (!existsSync(join(wtDir, "openspec"))) {
     cpSync(join(repoRoot, "openspec"), join(wtDir, "openspec"), { recursive: true });
@@ -71,25 +74,17 @@ async function provisionWorktree(pi: ExtensionAPI, ctx: LoopCtx, change: string,
       return "abort";
     }
     cpSync(srcChangeDir, wtChangeDir, { recursive: true });
-    await run(pi, "git", ["add", `openspec/changes/${change}`], wtDir);
-    await run(pi, "git", ["commit", "-m", `spec: add ${change} change`], wtDir);
+    await run(pi, ["git", "add", `openspec/changes/${change}`], wtDir);
+    await run(pi, ["git", "commit", "-m", `spec: add ${change} change`], wtDir);
   }
   const rootTodo = findTodoFile(repoRoot);
-  if (rootTodo && !existsSync(join(wtDir, "TODO.md"))) cpSync(rootTodo, join(wtDir, "TODO.md"));
+  if (rootTodo && !existsSync(join(wtDir, "TODO.md"))) {cpSync(rootTodo, join(wtDir, "TODO.md"));}
   return "ok";
 }
 
-export async function runPrefix(
-  pi: ExtensionAPI,
-  ctx: LoopCtx,
-  change: string,
-  dryRun: boolean
-): Promise<PrefixResult> {
-  const repoRoot = ctx.cwd as string;
-  const wtDir = join(repoRoot, WORKTREE_ROOT, change);
-  ctx.ui.notify(`dev-loop: change → ${change} (worktree ${wtDir})`, "info");
-
-  // Fresh run: clear stale control flags + sentinels left by a previous run.
+/** Fresh-run setup: clear stale control flags + sentinels, and ensure the
+ *  loop's artifacts are locally gitignored. */
+async function clearRunArtifacts(pi: ExtensionAPI, repoRoot: string): Promise<void> {
   rt.stopRequested = false;
   rt.fetchRequested = false;
   for (const s of [FETCH_SENTINEL, STOP_SENTINEL]) {
@@ -99,32 +94,38 @@ export async function runPrefix(
   await ensureLocalIgnore(pi, repoRoot, FETCH_SENTINEL);
   await ensureLocalIgnore(pi, repoRoot, STOP_SENTINEL);
   await ensureLocalIgnore(pi, repoRoot, LOOP_STATE_FILE);
+}
 
-  const { stdout: repoOut } = await run(pi, "gh", ["repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner"], repoRoot);
+/** Resolve → provision (worktree + env + openspec). Never blocks on a poll;
+ *  returns at the review/build boundary. Reads dryRun from rt.runCtx. */
+export async function runPrefix(pi: ExtensionAPI, ctx: LoopCtx, change: string): Promise<PrefixResult> {
+  const repoRoot = ctx.cwd;
+  const wtDir = join(repoRoot, WORKTREE_ROOT, change);
+  ctx.ui.notify(`dev-loop: change → ${change} (worktree ${wtDir})`, "info");
+  await clearRunArtifacts(pi, repoRoot);
+
+  const { stdout: repoOut } = await run(pi, ["gh", "repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner"], repoRoot);
   const repo = repoOut || "";
   if (!repo) {
     ctx.ui.notify("dev-loop: could not resolve repo via `gh repo view`", "error");
     return { kind: "abort" };
   }
   const pr = await prStateFor(pi, repo, change);
-
   if (pr.merged) {
-    if (existsSync(wtDir)) await removeWorktree(pi, repoRoot, change);
+    if (existsSync(wtDir)) {await removeWorktree(pi, repoRoot, change);}
     await syncMain(pi, ctx, repoRoot);
     ctx.ui.notify(`dev-loop: ${change} already merged in a prior run — cleaning up`, "info");
     return { kind: "merged" };
   }
-
-  if ((await provisionWorktree(pi, ctx, change, repoRoot, wtDir)) === "abort") return { kind: "abort" };
-
-  if (dryRun) {
-    if (!pr.open) await buildImplement(pi, ctx, change, wtDir);
+  if ((await provisionWorktree({ pi, ctx, change, wtDir })) === "abort") {return { kind: "abort" };}
+  if (rt.runCtx?.dryRun) {
+    if (!pr.open) {await buildImplement({ pi, ctx, change, wtDir });}
     ctx.ui.notify(`dev-loop: --dry-run → stopping (worktree left at ${wtDir})`, "info");
     return { kind: "dryRun" };
   }
   if (pr.open) {
     const prNum = pr.prNum as number;
-    const { stdout: head } = await run(pi, "git", ["rev-parse", "HEAD"], wtDir);
+    const { stdout: head } = await run(pi, ["git", "rev-parse", "HEAD"], wtDir);
     ctx.ui.notify(`dev-loop: resuming — PR #${prNum} already open`, "info");
     return { kind: "atReview", prNum, head, repo };
   }
@@ -132,9 +133,10 @@ export async function runPrefix(
 }
 
 // --- oneStep: per-phase handlers ----------------------------------------------
-async function handleBuild(pi: ExtensionAPI, ctx: LoopCtx, change: string, s: LoopState, wtDir: string, persist: () => void): Promise<StepOutcome> {
+async function handleBuild(step: StepCtx): Promise<StepOutcome> {
+  const { pi, ctx, change, s, wtDir, persist } = step;
   if (s.inner === BUILD_INNER.IMPLEMENT) {
-    await buildImplement(pi, ctx, change, wtDir);
+    await buildImplement({ pi, ctx, change, wtDir });
     if (rt.stopRequested) {
       s.stopReason = "stopped"; rt.interruptedChange = change;
       ctx.ui.notify(`dev-loop: stopped during build — worktree left; use /loop resume`, "warning");
@@ -143,7 +145,7 @@ async function handleBuild(pi: ExtensionAPI, ctx: LoopCtx, change: string, s: Lo
     s.inner = BUILD_INNER.PUSH; persist(); return "cont";
   }
   if (s.inner === BUILD_INNER.PUSH) {
-    const { code, stderr } = await run(pi, "git", ["push", "-u", "origin", change], wtDir);
+    const { code, stderr } = await run(pi, ["git", "push", "-u", "origin", change], wtDir);
     if (code !== 0) {
       s.stopReason = "push_failed"; rt.interruptedChange = change;
       ctx.ui.notify(`dev-loop: git push failed (${stderr}); stopping — fix then /loop resume`, "error");
@@ -154,7 +156,7 @@ async function handleBuild(pi: ExtensionAPI, ctx: LoopCtx, change: string, s: Lo
   if (s.inner === BUILD_INNER.PR) {
     let pr = await prStateFor(pi, s.repo, change);
     if (!pr.open) {
-      const { code, stderr } = await run(pi, "gh", ["pr", "create", "--title", change, "--head", change, "--body", `Implements OpenSpec change ${change}.`, "--repo", s.repo], wtDir);
+      const { code, stderr } = await run(pi, ["gh", "pr", "create", "--title", change, "--head", change, "--body", `Implements OpenSpec change ${change}.`, "--repo", s.repo], wtDir);
       if (code !== 0) {
         s.stopReason = "pr_create_failed"; rt.interruptedChange = change;
         ctx.ui.notify(`dev-loop: gh pr create failed (${stderr}); stopping — fix then /loop resume`, "error");
@@ -167,7 +169,7 @@ async function handleBuild(pi: ExtensionAPI, ctx: LoopCtx, change: string, s: Lo
       ctx.ui.notify("dev-loop: gh pr create reported success but no open PR found; stopping", "error");
       persist(); return "stop";
     }
-    const { stdout: head } = await run(pi, "git", ["rev-parse", "HEAD"], wtDir);
+    const { stdout: head } = await run(pi, ["git", "rev-parse", "HEAD"], wtDir);
     s.prNum = pr.prNum as number; s.head = head;
     s.phase = PHASE.REVIEW; s.inner = REVIEW_INNER.RECONCILE; s.round = 1;
     ctx.ui.notify(`dev-loop: PR #${s.prNum} — starting Codex review loop`, "info");
@@ -176,7 +178,8 @@ async function handleBuild(pi: ExtensionAPI, ctx: LoopCtx, change: string, s: Lo
   s.stopReason = "bad_state"; persist(); return "stop";
 }
 
-async function handleReconcile(pi: ExtensionAPI, ctx: LoopCtx, change: string, s: LoopState, wtDir: string, persist: () => void): Promise<StepOutcome> {
+async function handleReconcile(step: StepCtx): Promise<StepOutcome> {
+  const { pi, ctx, change, s, wtDir, persist } = step;
   switch (waitAction(rt.fetchRequested, s.reviewDeadline, Date.now())) {
     case "recheck":
       rt.fetchRequested = false;
@@ -190,7 +193,7 @@ async function handleReconcile(pi: ExtensionAPI, ctx: LoopCtx, change: string, s
     default:
       break;
   }
-  const r = await reconcileBranch(pi, s.repo, s.prNum, wtDir, change);
+  const r = await reconcileBranch(pi, { repo: s.repo, prNum: s.prNum, wtDir, change });
   if (r.kind === "diverged") {
     s.stopReason = "diverged"; rt.interruptedChange = change;
     ctx.ui.notify(`dev-loop: origin/${change} diverged from local; stopping — resolve then /loop resume`, "error");
@@ -205,7 +208,7 @@ async function handleReconcile(pi: ExtensionAPI, ctx: LoopCtx, change: string, s
     s.inner = REVIEW_INNER.RESOLVE_MAIN; persist(); return "cont";
   }
   if (r.kind === "main_merged_clean") {
-    const { code, stderr } = await run(pi, "git", ["push"], wtDir);
+    const { code, stderr } = await run(pi, ["git", "push"], wtDir);
     if (code !== 0) {
       s.stopReason = "push_failed"; rt.interruptedChange = change;
       ctx.ui.notify(`dev-loop: push of main merge failed (${stderr}); stopping — fix then /loop resume`, "error");
@@ -219,26 +222,28 @@ async function handleReconcile(pi: ExtensionAPI, ctx: LoopCtx, change: string, s
   s.inner = REVIEW_INNER.PROBE; persist(); return "cont";
 }
 
-async function handleResolveMain(pi: ExtensionAPI, ctx: LoopCtx, change: string, s: LoopState, wtDir: string, persist: () => void): Promise<StepOutcome> {
-  await resolveMainPhase(pi, ctx, change, wtDir);
+async function handleResolveMain(step: StepCtx): Promise<StepOutcome> {
+  const { pi, ctx, change, s, wtDir, persist } = step;
+  await resolveMainPhase({ pi, ctx, change, wtDir });
   if (rt.stopRequested) {
     s.stopReason = "stopped"; rt.interruptedChange = change;
     ctx.ui.notify(`dev-loop: stopped during main-merge resolution — PR + worktree left; use /loop resume`, "warning");
     persist(); return "stop";
   }
-  const { stdout: unmerged } = await run(pi, "git", ["diff", "--name-only", "--diff-filter=U"], wtDir);
+  const { stdout: unmerged } = await run(pi, ["git", "diff", "--name-only", "--diff-filter=U"], wtDir);
   if (unmerged) {
     s.stopReason = "main_conflict_unresolved"; rt.interruptedChange = change;
     ctx.ui.notify(`dev-loop: main-merge conflict not fully resolved (unmerged files remain); stopping — fix then /loop resume`, "error");
     persist(); return "stop";
   }
-  const { stdout: head } = await run(pi, "git", ["rev-parse", "HEAD"], wtDir);
+  const { stdout: head } = await run(pi, ["git", "rev-parse", "HEAD"], wtDir);
   s.head = head; s.triggerAt = null; s.reviewDeadline = null;
   s.inner = REVIEW_INNER.RECONCILE; persist(); return "cont";
 }
 
-async function handleProbe(pi: ExtensionAPI, ctx: LoopCtx, change: string, s: LoopState, persist: () => void): Promise<StepOutcome> {
-  const v = await readCodexVerdict(pi, s.repo, s.prNum, s.head, s.triggerAt);
+async function handleProbe(step: StepCtx): Promise<StepOutcome> {
+  const { pi, ctx, change, s, persist } = step;
+  const v = await readCodexVerdict(pi, { repo: s.repo, prNum: s.prNum, head: s.head, triggerAt: s.triggerAt });
   if (!v) {
     if (!s.triggerAt) { s.inner = REVIEW_INNER.TRIGGER; persist(); return "cont"; }
     s.inner = REVIEW_INNER.RECONCILE;
@@ -274,8 +279,9 @@ async function handleProbe(pi: ExtensionAPI, ctx: LoopCtx, change: string, s: Lo
   s.inner = REVIEW_INNER.FIX; persist(); return "cont";
 }
 
-async function handleTrigger(pi: ExtensionAPI, ctx: LoopCtx, s: LoopState, persist: () => void): Promise<StepOutcome> {
-  const { code, stderr } = await run(pi, "gh", ["pr", "comment", String(s.prNum), "--body", "@codex review", "--repo", s.repo]);
+async function handleTrigger(step: StepCtx): Promise<StepOutcome> {
+  const { pi, ctx, s, persist } = step;
+  const { code, stderr } = await run(pi, ["gh", "pr", "comment", String(s.prNum), "--body", "@codex review", "--repo", s.repo]);
   if (code !== 0) {
     s.stopReason = "trigger_failed";
     ctx.ui.notify(`dev-loop: trigger @codex review failed: ${stderr}`, "error");
@@ -288,21 +294,22 @@ async function handleTrigger(pi: ExtensionAPI, ctx: LoopCtx, s: LoopState, persi
   persist(); return "cont";
 }
 
-async function handleFix(pi: ExtensionAPI, ctx: LoopCtx, change: string, s: LoopState, wtDir: string, persist: () => void): Promise<StepOutcome> {
-  const { stdout: headPre } = await run(pi, "git", ["rev-parse", "HEAD"], wtDir);
-  await fixPhase(pi, ctx, change, wtDir, s.prNum, s.round, s.suggestions);
+async function handleFix(step: StepCtx): Promise<StepOutcome> {
+  const { pi, ctx, change, s, wtDir, persist } = step;
+  const { stdout: headPre } = await run(pi, ["git", "rev-parse", "HEAD"], wtDir);
+  await fixPhase({ pi, ctx, change, wtDir }, s);
   if (rt.stopRequested) {
     s.stopReason = "stopped"; rt.interruptedChange = change;
     ctx.ui.notify(`dev-loop: stopped during fix round ${s.round} — PR + worktree left; use /loop resume`, "warning");
     persist(); return "stop";
   }
-  const { stdout: headPost } = await run(pi, "git", ["rev-parse", "HEAD"], wtDir);
+  const { stdout: headPost } = await run(pi, ["git", "rev-parse", "HEAD"], wtDir);
   if (headPre === headPost) {
     s.stopReason = "no_progress"; rt.interruptedChange = change;
     ctx.ui.notify(`dev-loop: agent made no progress on round ${s.round}; stopping (PR + worktree left)`, "warning");
     persist(); return "stop";
   }
-  const { code: pushCode, stderr: pushErr } = await run(pi, "git", ["push"], wtDir);
+  const { code: pushCode, stderr: pushErr } = await run(pi, ["git", "push"], wtDir);
   if (pushCode !== 0) {
     s.stopReason = "push_failed"; rt.interruptedChange = change;
     ctx.ui.notify(`dev-loop: git push failed on round ${s.round} (${pushErr}); stopping — fix then /loop resume`, "error");
@@ -313,32 +320,34 @@ async function handleFix(pi: ExtensionAPI, ctx: LoopCtx, change: string, s: Loop
   s.inner = REVIEW_INNER.RECONCILE; persist(); return "cont";
 }
 
-async function handleReview(pi: ExtensionAPI, ctx: LoopCtx, change: string, s: LoopState, wtDir: string, persist: () => void): Promise<StepOutcome> {
+async function handleReview(step: StepCtx): Promise<StepOutcome> {
+  const { s, persist } = step;
   switch (s.inner) {
-    case REVIEW_INNER.RECONCILE: return handleReconcile(pi, ctx, change, s, wtDir, persist);
-    case REVIEW_INNER.RESOLVE_MAIN: return handleResolveMain(pi, ctx, change, s, wtDir, persist);
-    case REVIEW_INNER.PROBE: return handleProbe(pi, ctx, change, s, persist);
-    case REVIEW_INNER.TRIGGER: return handleTrigger(pi, ctx, s, persist);
-    case REVIEW_INNER.FIX: return handleFix(pi, ctx, change, s, wtDir, persist);
+    case REVIEW_INNER.RECONCILE: return handleReconcile(step);
+    case REVIEW_INNER.RESOLVE_MAIN: return handleResolveMain(step);
+    case REVIEW_INNER.PROBE: return handleProbe(step);
+    case REVIEW_INNER.TRIGGER: return handleTrigger(step);
+    case REVIEW_INNER.FIX: return handleFix(step);
     default: s.stopReason = "bad_state"; persist(); return "stop";
   }
 }
 
-async function handleArchive(pi: ExtensionAPI, ctx: LoopCtx, change: string, s: LoopState, wtDir: string, persist: () => void): Promise<StepOutcome> {
+async function handleArchive(step: StepCtx): Promise<StepOutcome> {
+  const { pi, ctx, change, s, wtDir, persist } = step;
   const wtChangeDir = join(wtDir, "openspec", "changes", change);
   if (existsSync(wtChangeDir)) {
-    const { code, stderr } = await run(pi, "openspec", ["archive", change, "-y"], wtDir);
+    const { code, stderr } = await run(pi, ["openspec", "archive", change, "-y"], wtDir);
     if (code !== 0) {
       s.stopReason = "archive_failed"; rt.interruptedChange = change;
       ctx.ui.notify(`dev-loop: openspec archive failed: ${stderr}; stopping (PR + worktree left)`, "warning");
       persist(); return "stop";
     }
-    if (!s.oneOff) markChangeDone(wtDir, change);
-    const { stdout: dirty } = await run(pi, "git", ["status", "--porcelain"], wtDir);
+    if (!s.oneOff) {markChangeDone(wtDir, change);}
+    const { stdout: dirty } = await run(pi, ["git", "status", "--porcelain"], wtDir);
     if (dirty) {
-      await run(pi, "git", ["add", "-A"], wtDir);
-      await run(pi, "git", ["commit", "-m", `chore: archive ${change}`], wtDir);
-      const { code: pc, stderr: pe } = await run(pi, "git", ["push"], wtDir);
+      await run(pi, ["git", "add", "-A"], wtDir);
+      await run(pi, ["git", "commit", "-m", `chore: archive ${change}`], wtDir);
+      const { code: pc, stderr: pe } = await run(pi, ["git", "push"], wtDir);
       if (pc !== 0) {
         s.stopReason = "archive_push_failed"; rt.interruptedChange = change;
         ctx.ui.notify(`dev-loop: git push of archive commit failed (${pe}); stopping — fix then /loop resume`, "error");
@@ -349,8 +358,9 @@ async function handleArchive(pi: ExtensionAPI, ctx: LoopCtx, change: string, s: 
   s.phase = PHASE.MERGE; persist(); return "cont";
 }
 
-async function handleMerge(pi: ExtensionAPI, ctx: LoopCtx, s: LoopState, persist: () => void): Promise<StepOutcome> {
-  const { code, stderr } = await run(pi, "gh", ["pr", "merge", String(s.prNum), "--squash", "--delete-branch", "--repo", s.repo]);
+async function handleMerge(step: StepCtx): Promise<StepOutcome> {
+  const { pi, ctx, s, persist } = step;
+  const { code, stderr } = await run(pi, ["gh", "pr", "merge", String(s.prNum), "--squash", "--delete-branch", "--repo", s.repo]);
   if (code !== 0) {
     s.stopReason = "merge_failed";
     ctx.ui.notify(`dev-loop: gh pr merge failed: ${stderr}`, "error");
@@ -359,66 +369,63 @@ async function handleMerge(pi: ExtensionAPI, ctx: LoopCtx, s: LoopState, persist
   s.phase = PHASE.CLEANUP; persist(); return "cont";
 }
 
-async function handleCleanup(pi: ExtensionAPI, ctx: LoopCtx, change: string, s: LoopState, repoRoot: string): Promise<StepOutcome> {
-  await removeWorktree(pi, repoRoot, change);
-  await syncMain(pi, ctx, repoRoot);
+async function handleCleanup(step: StepCtx): Promise<StepOutcome> {
+  const { pi, ctx, change } = step;
+  await removeWorktree(pi, ctx.cwd, change);
+  await syncMain(pi, ctx, ctx.cwd);
   return "done";
 }
 
-/** One state-machine transition. Mutates `s` and persists it. */
-export async function oneStep(pi: ExtensionAPI, ctx: LoopCtx, change: string, s: LoopState): Promise<StepOutcome> {
-  const repoRoot = ctx.cwd as string;
-  const wtDir = join(repoRoot, WORKTREE_ROOT, change);
-  const persist = () => writeLoopState(repoRoot, change, s);
-  if (s.phase === PHASE.BUILD) return handleBuild(pi, ctx, change, s, wtDir, persist);
-  if (s.phase === PHASE.REVIEW) return handleReview(pi, ctx, change, s, wtDir, persist);
-  if (s.phase === PHASE.ARCHIVE) return handleArchive(pi, ctx, change, s, wtDir, persist);
-  if (s.phase === PHASE.MERGE) return handleMerge(pi, ctx, s, persist);
-  if (s.phase === PHASE.CLEANUP) return handleCleanup(pi, ctx, change, s, repoRoot);
+/** One state-machine transition. Dispatches to the per-phase handler. */
+export async function oneStep(step: StepCtx): Promise<StepOutcome> {
+  const { s, persist } = step;
+  if (s.phase === PHASE.BUILD) {return handleBuild(step);}
+  if (s.phase === PHASE.REVIEW) {return handleReview(step);}
+  if (s.phase === PHASE.ARCHIVE) {return handleArchive(step);}
+  if (s.phase === PHASE.MERGE) {return handleMerge(step);}
+  if (s.phase === PHASE.CLEANUP) {return handleCleanup(step);}
   s.stopReason = "bad_state"; persist(); return "stop";
 }
 
+type InitState = { s: LoopState } | "completed" | "aborted";
+
+function seedFromPrefix(r: PrefixResult, oneOff: boolean): LoopState | null {
+  if (r.kind === "atReview") {return { phase: PHASE.REVIEW, inner: REVIEW_INNER.RECONCILE, round: 1, prNum: r.prNum, head: r.head, repo: r.repo, triggerAt: null, reviewDeadline: null, seenSignatures: [], suggestions: [], stopReason: null, oneOff };}
+  if (r.kind === "atBuild") {return { phase: PHASE.BUILD, inner: BUILD_INNER.IMPLEMENT, round: 0, prNum: 0, head: "", repo: r.repo, triggerAt: null, reviewDeadline: null, seenSignatures: [], suggestions: [], stopReason: null, oneOff };}
+  return null;
+}
+
+async function rederiveState(pi: ExtensionAPI, ctx: LoopCtx, change: string): Promise<InitState> {
+  const r = await runPrefix(pi, ctx, change);
+  if (r.kind === "merged") {return "completed";}
+  if (r.kind === "dryRun" || r.kind === "abort") {return "aborted";}
+  const s = seedFromPrefix(r, rt.runCtx?.oneOff ?? false);
+  if (s) {writeLoopState(ctx.cwd, change, s);}
+  return s ? { s } : "aborted";
+}
+
+/** Read persisted state; if absent or at RESOLVE/PROVISION, re-derive via runPrefix. */
+async function resolveInitialState(pi: ExtensionAPI, ctx: LoopCtx, change: string): Promise<InitState> {
+  const s = readLoopState(ctx.cwd, change);
+  if (s && s.phase !== PHASE.RESOLVE && s.phase !== PHASE.PROVISION) {return { s };}
+  return rederiveState(pi, ctx, change);
+}
+
 /** Drive one change from its persisted state to suspension or completion. */
-export async function driveChange(
-  pi: ExtensionAPI,
-  ctx: LoopCtx,
-  change: string,
-  dryRun: boolean,
-  oneOff: boolean
-): Promise<"completed" | "suspended" | "stopped" | "aborted"> {
-  const repoRoot = ctx.cwd as string;
-  let s = readLoopState(repoRoot, change);
-  // RESOLVE/PROVISION/no-state: re-derive via runPrefix. BUILD is a persisted
-  // inner machine handled by oneStep, so a crashed BUILD state resumes there.
-  if (!s || s.phase === PHASE.RESOLVE || s.phase === PHASE.PROVISION) {
-    const r = await runPrefix(pi, ctx, change, dryRun);
-    if (r.kind === "merged") return "completed";
-    if (r.kind === "dryRun" || r.kind === "abort") return "aborted";
-    if (r.kind === "atReview") {
-      s = {
-        phase: PHASE.REVIEW, inner: REVIEW_INNER.RECONCILE, round: 1,
-        prNum: r.prNum, head: r.head, repo: r.repo,
-        triggerAt: null, reviewDeadline: null, seenSignatures: [], suggestions: [], stopReason: null, oneOff,
-      };
-      writeLoopState(repoRoot, change, s);
-    } else if (r.kind === "atBuild") {
-      s = {
-        phase: PHASE.BUILD, inner: BUILD_INNER.IMPLEMENT, round: 0,
-        prNum: 0, head: "", repo: r.repo,
-        triggerAt: null, reviewDeadline: null, seenSignatures: [], suggestions: [], stopReason: null, oneOff,
-      };
-      writeLoopState(repoRoot, change, s);
-    }
-  }
-  // Reaching here means s is set (non-null path above returns or reassigns it);
-  // guard for the type checker (PrefixResult is exhaustive, so this is unreachable).
-  if (!s) return "aborted";
+export async function driveChange(pi: ExtensionAPI, ctx: LoopCtx, change: string): Promise<"completed" | "suspended" | "stopped" | "aborted"> {
+  const init = await resolveInitialState(pi, ctx, change);
+  if (init === "completed" || init === "aborted") {return init;}
+  const s = init.s;
+  const repoRoot = ctx.cwd;
+  const wtDir = join(repoRoot, WORKTREE_ROOT, change);
+  const persist = () => writeLoopState(repoRoot, change, s);
+  const step: StepCtx = { pi, ctx, change, s, wtDir, persist };
   while (true) {
     if (rt.stopRequested) { s.stopReason = "stopped"; writeLoopState(repoRoot, change, s); return "stopped"; }
-    const out = await oneStep(pi, ctx, change, s);
-    if (out === "suspend") return "suspended";
-    if (out === "done") return "completed";
-    if (out === "stop") return "stopped";
+    const out = await oneStep(step);
+    if (out === "suspend") {return "suspended";}
+    if (out === "done") {return "completed";}
+    if (out === "stop") {return "stopped";}
     await yieldTick();
   }
 }
@@ -426,35 +433,45 @@ export async function driveChange(
 /** Re-entrant entry (the handler, the review_wait timer, and /loop fetch all
  *  call it). Walks steps until the current change suspends or finishes; for
  *  --all, chains the next TODO change. Owns loopActive + ticker lifecycle. */
+function handleCompleted(ctx: LoopCtx): "chain" | "done" {
+  const change = rt.runCtx?.change ?? "";
+  clearLoopState(ctx.cwd, change);
+  ctx.ui.notify(`dev-loop: "${change}" merged ✅`, "info");
+  if (rt.runCtx?.all && !rt.runCtx.oneOff) {
+    const next = pickTask(ctx.cwd);
+    if (next) { rt.runCtx = { ...rt.runCtx, change: next.text }; return "chain"; }
+  }
+  rt.loopActive = false; stopSentinelTicker(); rt.runCtx = null;
+  return "done";
+}
+
+function endChain(change: string, stopped: boolean): void {
+  if (stopped) {rt.interruptedChange = change;}
+  rt.loopActive = false; stopSentinelTicker(); rt.runCtx = null;
+}
+
 export async function runLoopChain(): Promise<void> {
-  if (!rt.piRef || !rt.runCtx || rt.stepping) return;
+  if (!rt.piRef || !rt.runCtx || rt.stepping) {return;}
   const pi = rt.piRef;
   const ctx = rt.runCtx.ctx;
   rt.stepping = true;
   try {
     while (rt.runCtx) {
       if (rt.stopRequested) {
-        const s = readLoopState(ctx.cwd as string, rt.runCtx.change);
-        if (s) { s.stopReason = "stopped"; writeLoopState(ctx.cwd as string, rt.runCtx.change, s); }
-        rt.interruptedChange = rt.runCtx.change;
+        const ch = rt.runCtx.change;
+        const s = readLoopState(ctx.cwd, ch);
+        if (s) { s.stopReason = "stopped"; writeLoopState(ctx.cwd, ch, s); }
         ctx.ui.notify(`dev-loop: stopped (PR + worktree left); use /loop resume`, "warning");
-        rt.loopActive = false; stopSentinelTicker(); rt.runCtx = null;
+        endChain(ch, true);
         return;
       }
-      const outcome = await driveChange(pi, ctx, rt.runCtx.change, rt.runCtx.dryRun, rt.runCtx.oneOff);
-      if (outcome === "suspended") return;
+      const outcome = await driveChange(pi, ctx, rt.runCtx.change);
+      if (outcome === "suspended") {return;}
       if (outcome === "completed") {
-        clearLoopState(ctx.cwd as string, rt.runCtx.change);
-        ctx.ui.notify(`dev-loop: "${rt.runCtx.change}" merged ✅`, "info");
-        if (rt.runCtx.all && !rt.runCtx.oneOff) {
-          const next = pickTask(ctx.cwd as string);
-          if (next) { rt.runCtx = { ...rt.runCtx, change: next.text }; continue; }
-        }
-        rt.loopActive = false; stopSentinelTicker(); rt.runCtx = null;
+        if (handleCompleted(ctx) === "chain") {continue;}
         return;
       }
-      if (outcome === "stopped") rt.interruptedChange = rt.runCtx.change;
-      rt.loopActive = false; stopSentinelTicker(); rt.runCtx = null;
+      endChain(rt.runCtx.change, outcome === "stopped");
       return;
     }
   } finally {
