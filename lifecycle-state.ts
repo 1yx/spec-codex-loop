@@ -37,12 +37,21 @@ export const REVIEW_INNER = Object.freeze({
   RECONCILE: "review_reconcile", // fetch + reconcile local/origin HEAD
   PROBE: "review_probe",         // readCodexVerdict once (no side effects)
   TRIGGER: "review_trigger",     // post @codex review, record triggerAt + deadline
-  WAIT: "review_wait",           // schedule re-probe + RETURN (the de-block point)
   FIX: "review_fix",             // fixPhase (agent turn), next round
-  TERMINAL: "review_terminal",   // stopped/quota/timeout/repeat/no_progress
 } as const);
 
 export type ReviewInner = (typeof REVIEW_INNER)[keyof typeof REVIEW_INNER];
+
+/** Inner states of the build phase: implement+commit → push → open PR. Each is a
+ *  persisted, re-entrant step, so a crash between them resumes at the right one
+ *  instead of re-running the whole (creative, expensive) implement turn. */
+export const BUILD_INNER = Object.freeze({
+  IMPLEMENT: "build_implement", // agent: openspec-apply-change + tests + commit
+  PUSH: "build_push",           // git push -u origin <change>
+  PR: "build_pr",               // gh pr create → enter REVIEW
+} as const);
+
+export type BuildInner = (typeof BUILD_INNER)[keyof typeof BUILD_INNER];
 
 /** Legal outer transitions. Flow is linear; the review loop lives inside REVIEW
  *  via REVIEW_INNER, so REVIEW → ARCHIVE is the only forward edge out of it.

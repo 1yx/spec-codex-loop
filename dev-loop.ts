@@ -6,7 +6,7 @@
  *   TODO.md `- [ ] <change>`  →  worktree .worktree/<change> on branch <change>
  *   →  openspec-apply-change (implement tasks) → commit → push → gh pr create
  *   →  @codex review → fix per suggestions → push  (repeat until Codex passes / repeats)
- *   →  openspec archive → merge --squash → mark `- [x]` → remove worktree
+ *   →  openspec archive + mark `- [x]` + commit → merge --squash → remove worktree → sync local main
  *
  * Outside the loop: create the OpenSpec change (e.g. via the explore / grill-me
  * skills), then add its name as a `- [ ] <change>` line in TODO.md. The change
@@ -26,7 +26,7 @@
 import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { PHASE, REVIEW_INNER } from "./lifecycle-state.ts";
+import { PHASE, REVIEW_INNER, BUILD_INNER } from "./lifecycle-state.ts";
 
 const CODEX_LOGIN = "chatgpt-codex-connector"; // bot login prefix; API may append "[bot]"
 const PASS_RE = /Didn't find any major issues/i;
@@ -57,6 +57,11 @@ interface PollResult {
   timeout: boolean;
   stopped: boolean;
   quotaExhausted: boolean;
+  /** Codex posted after our trigger but we couldn't classify it as
+   *  pass/quota/suggestions (e.g. a bot "Something went wrong" error). Distinct
+   *  from a null return (Codex hasn't spoken at all) so the caller re-triggers
+   *  instead of waiting out the timeout on a dead trigger. */
+  unclassified: boolean;
   suggestions: Suggestion[];
 }
 
@@ -124,6 +129,7 @@ interface LoopState {
   seenSignatures: string[];
   suggestions: Suggestion[];
   stopReason: string | null;
+  oneOff: boolean;
 }
 
 function statePath(repoRoot: string, change: string): string {
@@ -269,6 +275,23 @@ async function ensureLocalIgnore(pi: ExtensionAPI, repoRoot: string, entry: stri
   }
 }
 
+/** Remove `entry` from .git/info/exclude if present — undoes an earlier
+ *  local-ignore so the file can be tracked/committed. Best-effort. */
+async function removeFromLocalIgnore(pi: ExtensionAPI, repoRoot: string, entry: string) {
+  const { stdout: gitDir, code } = await run(pi, "git", ["rev-parse", "--git-dir"], repoRoot);
+  if (code !== 0 || !gitDir) return;
+  const absGitDir = gitDir.startsWith("/") ? gitDir : join(repoRoot, gitDir);
+  const excludePath = join(absGitDir, "info", "exclude");
+  try {
+    if (!existsSync(excludePath)) return;
+    const cur = readFileSync(excludePath, "utf-8");
+    if (!cur.split("\n").some((l) => l.trim() === entry)) return;
+    writeFileSync(excludePath, cur.split("\n").filter((l) => l.trim() !== entry).join("\n"));
+  } catch {
+    /* non-fatal */
+  }
+}
+
 /** Copy `.env*` files from the main repo into the worktree at the same
  *  relative path. These are nearly always gitignored, so the origin/main
  *  checkout the worktree is built from is missing them. Walks the whole tree
@@ -303,6 +326,24 @@ async function removeWorktree(pi: ExtensionAPI, repoRoot: string, change: string
   const wtDir = join(repoRoot, WORKTREE_ROOT, change);
   await run(pi, "git", ["worktree", "remove", "--force", wtDir], repoRoot);
   await run(pi, "git", ["branch", "-D", change], repoRoot);
+}
+
+/** Fast-forward local main to origin/main once a PR's squash-merge lands, so
+ *  the working tree reflects the merged change (archived openspec move + TODO.md
+ *  `- [x]` flip). A local-only untracked TODO.md (pre-tracking migration) would
+ *  block the merge; the incoming copy is a superset of it (seeded into the
+ *  worktree before the flip), so dropping the untracked file is lossless.
+ *  No-op once TODO.md is tracked. Best-effort: a non-fast-forwardable main warns. */
+async function syncMain(pi: ExtensionAPI, ctx: any, repoRoot: string) {
+  await run(pi, "git", ["fetch", "origin", "main"], repoRoot);
+  await run(pi, "git", ["checkout", "main"], repoRoot);
+  const rootTodo = findTodoFile(repoRoot);
+  if (rootTodo) {
+    const { stdout } = await run(pi, "git", ["ls-files", "--", relative(repoRoot, rootTodo)], repoRoot);
+    if (!stdout) { try { unlinkSync(rootTodo); } catch { /* best-effort */ } }
+  }
+  const { code, stderr } = await run(pi, "git", ["merge", "--ff-only", "origin/main"], repoRoot);
+  if (code !== 0) ctx.ui.notify(`dev-loop: local main can't fast-forward to origin/main (${stderr}); merge manually`, "warning");
 }
 
 /** Open/merged PR state for a change's head branch (used for resume). */
@@ -452,10 +493,10 @@ async function readCodexVerdict(
   if (
     codexIssue.some((c) => PASS_RE.test(c.body) && shortSha(passCommit(c.body) ?? "") === head7)
   ) {
-    return { pass: true, timeout: false, stopped: false, quotaExhausted: false, suggestions: [] };
+    return { pass: true, timeout: false, stopped: false, quotaExhausted: false, unclassified: false, suggestions: [] };
   }
   if (triggerAt && codexIssue.some((c) => QUOTA_RE.test(c.body) && c.created_at > triggerAt)) {
-    return { pass: false, timeout: false, stopped: false, quotaExhausted: true, suggestions: [] };
+    return { pass: false, timeout: false, stopped: false, quotaExhausted: true, unclassified: false, suggestions: [] };
   }
 
   const reviews =
@@ -480,18 +521,31 @@ async function readCodexVerdict(
       )
       .map(parseSuggestion)
       .filter((s) => s.title);
-    return { pass: false, timeout: false, stopped: false, quotaExhausted: false, suggestions };
+    return { pass: false, timeout: false, stopped: false, quotaExhausted: false, unclassified: false, suggestions };
+  }
+  // Codex posted after our trigger but matched nothing above → a reply we don't
+  // recognize as a verdict. The canonical case is a bot "Something went wrong"
+  // error (which empirically does NOT auto-retry — needs a re-trigger), plus
+  // partial output or unknown future failure modes. Don't wait out the timeout
+  // on a dead trigger: return unclassified so the caller stops + clears
+  // triggerAt, and /loop resume re-posts @codex review.
+  if (triggerAt && codexIssue.some((c) => c.created_at > triggerAt)) {
+    return { pass: false, timeout: false, stopped: false, quotaExhausted: false, unclassified: true, suggestions: [] };
   }
   return null;
 }
 
 // --- agent-driven phases (each scoped to the change's worktree) ----------------
-async function buildPhase(
+/** Build step 1 (agent turn): implement the OpenSpec change + tests green + commit.
+ *  No push / PR here — those are separate persisted oneStep transitions, so a crash
+ *  after this step won't re-run the creative implement work. The skill reads
+ *  tasks.md status, so re-running on a resume where tasks are already [x] is a
+ *  near-no-op (commit becomes a no-op if nothing changed). */
+async function buildImplement(
   pi: ExtensionAPI,
   ctx: any,
   change: string,
-  wtDir: string,
-  dryRun: boolean
+  wtDir: string
 ) {
   const prompt = [
     `Implement the OpenSpec change "${change}" by following the openspec-apply-change skill.`,
@@ -507,15 +561,7 @@ async function buildPhase(
     "flipping each `- [ ]` to `- [x]` as you complete it. Run the project's tests and fix",
     "until green. If you hit a real blocker, stop and report — do not guess.",
     "",
-    "Then commit with a clear conventional message.",
-    dryRun
-      ? "Stop when committed (--dry-run: do not push or open a PR)."
-      : [
-          "Then ship it:",
-          `  git push -u origin ${change}`,
-          `  gh pr create --title "${change}" --head ${change} --body "Implements OpenSpec change ${change}."`,
-          "Stop only once the PR is open.",
-        ].join("\n"),
+    "Then commit with a clear conventional message and stop. (Push and PR are handled separately.)",
   ].join("\n");
   ctx.ui.notify(`dev-loop: building ${change} (driving agent in worktree…)`, "info");
   await driveAgent(pi, prompt);
@@ -572,7 +618,7 @@ async function checkPreconditions(pi: ExtensionAPI, ctx: any): Promise<boolean> 
 
 type PrefixResult =
   | { kind: "atReview"; prNum: number; head: string; repo: string }
-  | { kind: "stop" }
+  | { kind: "atBuild"; repo: string }
   | { kind: "merged" }
   | { kind: "abort" }
   | { kind: "dryRun" };
@@ -611,6 +657,7 @@ async function runPrefix(
   // Already merged in a prior run → finish cleanup.
   if (pr.merged) {
     if (existsSync(wtDir)) await removeWorktree(pi, repoRoot, change);
+    await syncMain(pi, ctx, repoRoot);
     ctx.ui.notify(`dev-loop: ${change} already merged in a prior run — cleaning up`, "info");
     return { kind: "merged" };
   }
@@ -657,34 +704,33 @@ async function runPrefix(
     await run(pi, "git", ["commit", "-m", `spec: add ${change} change`], wtDir);
   }
 
+  // Seed the worktree's TODO.md so the archive step can flip this change's line
+  // and commit it. origin/main may not track TODO.md yet (first run); the
+  // checkout then lacks it, so copy the main repo's backlog in.
+  const rootTodo = findTodoFile(repoRoot);
+  if (rootTodo && !existsSync(join(wtDir, "TODO.md"))) {
+    cpSync(rootTodo, join(wtDir, "TODO.md"));
+  }
+
   if (dryRun) {
-    if (!pr.open) await buildPhase(pi, ctx, change, wtDir, true);
+    // --dry-run: implement + commit only, then stop. Ephemeral (no state
+    // persisted), so not re-entrant — same surface as the old single-turn build.
+    if (!pr.open) await buildImplement(pi, ctx, change, wtDir);
     ctx.ui.notify(`dev-loop: --dry-run → stopping (worktree left at ${wtDir})`, "info");
     return { kind: "dryRun" };
   }
 
-  let prNum: number;
+  // PR already open (a prior run cleared build) → straight to review.
   if (pr.open) {
-    prNum = pr.prNum as number;
+    const prNum = pr.prNum as number;
+    const { stdout: head } = await run(pi, "git", ["rev-parse", "HEAD"], wtDir);
     ctx.ui.notify(`dev-loop: resuming — PR #${prNum} already open`, "info");
-  } else {
-    await buildPhase(pi, ctx, change, wtDir, false);
-    if (stopRequested) {
-      interruptedChange = change;
-      ctx.ui.notify(`dev-loop: stopped during build — worktree left; use /loop resume`, "warning");
-      return { kind: "stop" };
-    }
-    const after = await prStateFor(pi, repo, change);
-    if (!after.open) {
-      ctx.ui.notify("dev-loop: no open PR after buildPhase; aborting (worktree left)", "error");
-      return { kind: "abort" };
-    }
-    prNum = after.prNum as number;
+    return { kind: "atReview", prNum, head, repo };
   }
 
-  ctx.ui.notify(`dev-loop: PR #${prNum} — starting Codex review loop`, "info");
-  const { stdout: head } = await run(pi, "git", ["rev-parse", "HEAD"], wtDir);
-  return { kind: "atReview", prNum, head, repo };
+  // Fresh build: hand off to the BUILD inner machine (implement → push → pr).
+  // Each step persists, so a crash resumes mid-build instead of re-running it.
+  return { kind: "atBuild", repo };
 }
 
 /** Find the change's checkbox line and flip it to [x]. */
@@ -715,13 +761,63 @@ async function oneStep(
   const wtChangeDir = join(wtDir, "openspec", "changes", change);
   const persist = () => writeLoopState(repoRoot, change, s);
 
+  if (s.phase === PHASE.BUILD) {
+    if (s.inner === BUILD_INNER.IMPLEMENT) {
+      // Agent turn: openspec-apply-change → implement tasks → tests → commit.
+      // Re-runnable: the skill reads tasks.md, so a resume after a mid-turn crash
+      // finds tasks already [x] and the commit is a no-op if nothing changed.
+      // PUSH/PR are separate persisted steps, so a crash there does NOT re-run this.
+      await buildImplement(pi, ctx, change, wtDir);
+      if (stopRequested) {
+        s.stopReason = "stopped"; interruptedChange = change;
+        ctx.ui.notify(`dev-loop: stopped during build — worktree left; use /loop resume`, "warning");
+        persist(); return "stop";
+      }
+      s.inner = BUILD_INNER.PUSH; persist(); return "cont";
+    }
+    if (s.inner === BUILD_INNER.PUSH) {
+      // Idempotent: `git push` on an already-up-to-date branch is a no-op, so a
+      // crash between push-success and persisting inner=PR just re-pushes safely.
+      const { code, stderr } = await run(pi, "git", ["push", "-u", "origin", change], wtDir);
+      if (code !== 0) {
+        s.stopReason = "push_failed"; interruptedChange = change;
+        ctx.ui.notify(`dev-loop: git push failed (${stderr}); stopping — fix then /loop resume`, "error");
+        persist(); return "stop";
+      }
+      s.inner = BUILD_INNER.PR; persist(); return "cont";
+    }
+    if (s.inner === BUILD_INNER.PR) {
+      // Idempotent: if a PR already exists (crash after create), skip re-creating —
+      // `gh pr create` errors on an existing branch PR.
+      let pr = await prStateFor(pi, s.repo, change);
+      if (!pr.open) {
+        const { code, stderr } = await run(pi, "gh", ["pr", "create", "--title", change, "--head", change, "--body", `Implements OpenSpec change ${change}.`, "--repo", s.repo], wtDir);
+        if (code !== 0) {
+          s.stopReason = "pr_create_failed"; interruptedChange = change;
+          ctx.ui.notify(`dev-loop: gh pr create failed (${stderr}); stopping — fix then /loop resume`, "error");
+          persist(); return "stop";
+        }
+        pr = await prStateFor(pi, s.repo, change);
+      }
+      if (!pr.open) {
+        s.stopReason = "pr_create_failed"; interruptedChange = change;
+        ctx.ui.notify("dev-loop: gh pr create reported success but no open PR found; stopping", "error");
+        persist(); return "stop";
+      }
+      const { stdout: head } = await run(pi, "git", ["rev-parse", "HEAD"], wtDir);
+      s.prNum = pr.prNum as number; s.head = head;
+      s.phase = PHASE.REVIEW; s.inner = REVIEW_INNER.RECONCILE; s.round = 1;
+      ctx.ui.notify(`dev-loop: PR #${s.prNum} — starting Codex review loop`, "info");
+      persist(); return "cont";
+    }
+    s.stopReason = "bad_state"; persist(); return "stop";
+  }
+
   if (s.phase === PHASE.REVIEW) {
     // RECONCILE is also the resume/wake target: when we sleep we persist
     // inner=RECONCILE, so every wake (timer, /loop fetch, resume) re-probes
-    // instead of re-scheduling forever. Legacy inner=WAIT (older builds) is
-    // folded back to RECONCILE on entry.
-    if (s.inner === REVIEW_INNER.RECONCILE || s.inner === REVIEW_INNER.WAIT) {
-      if (s.inner === REVIEW_INNER.WAIT) s.inner = REVIEW_INNER.RECONCILE;
+    // instead of re-scheduling forever.
+    if (s.inner === REVIEW_INNER.RECONCILE) {
       switch (waitAction(fetchRequested, s.reviewDeadline, Date.now())) {
         case "recheck":
           fetchRequested = false;
@@ -759,22 +855,41 @@ async function oneStep(
       const v = await readCodexVerdict(pi, s.repo, s.prNum, s.head, s.triggerAt);
       if (!v) {
         if (!s.triggerAt) { s.inner = REVIEW_INNER.TRIGGER; persist(); return "cont"; }
-        // Triggered, no verdict yet → sleep. Persist RECONCILE (not WAIT) so the
-        // timer wake re-probes; the old WAIT-then-reschedule loop never re-read
-        // a verdict that landed between polls.
+        // Triggered, no verdict yet → sleep. Persist RECONCILE so the timer
+        // wake re-probes (rather than a dedicated wait state that would
+        // re-schedule forever and miss a verdict landing between polls).
         s.inner = REVIEW_INNER.RECONCILE;
         ctx.ui.notify(`dev-loop: no Codex verdict on ${shortSha(s.head)} (round ${s.round}); waiting ${REVIEW_WAIT_MS / 60000}min — touch ${FETCH_SENTINEL} to recheck, /loop stop to stop`, "info");
         persist();
         scheduleWait(REVIEW_WAIT_MS);
         return "suspend";
       }
+      if (v.unclassified) {
+        // Codex replied (something landed after our trigger) but matched no known
+        // verdict pattern — typically a bot "Something went wrong" error (which
+        // empirically does NOT auto-retry — needs a manual re-trigger), or
+        // partial output. Don't wait out the timeout on a dead trigger: stop
+        // with an honest reason and clear triggerAt so /loop resume takes the
+        // !triggerAt → TRIGGER branch and re-posts @codex review (the recovery
+        // you'd do by hand). No retry counter: each attempt needs a manual resume.
+        s.stopReason = "codex_error"; interruptedChange = change;
+        s.triggerAt = null;
+        ctx.ui.notify(`dev-loop: Codex replied with an unrecognized comment on round ${s.round} (likely an error); stopping — /loop resume re-triggers @codex review`, "warning");
+        persist(); return "stop";
+      }
       if (v.pass || v.suggestions.length === 0) {
         ctx.ui.notify(`dev-loop: Codex passed on round ${s.round}`, "info");
         s.phase = PHASE.ARCHIVE; s.inner = null; persist(); return "cont";
       }
       if (v.quotaExhausted) {
+        // Clear triggerAt so /loop resume re-triggers @codex review. Without this,
+        // the stale quota comment (which never leaves the PR) keeps matching the
+        // `triggerAt && created_at > triggerAt` gate on every resume → dead loop.
+        // Clearing it also disables that gate, so a review Codex posts meanwhile
+        // (e.g. you re-triggered by hand) is reached, not masked by the old quota.
         s.stopReason = "quota"; interruptedChange = change;
-        ctx.ui.notify(`dev-loop: Codex review quota exhausted — stopping (PR + worktree left); use /loop resume after it resets`, "warning");
+        s.triggerAt = null;
+        ctx.ui.notify(`dev-loop: Codex review quota exhausted — stopping (PR + worktree left); /loop resume after it resets re-triggers @codex review`, "warning");
         persist(); return "stop";
       }
       const sig = suggestionKey(v.suggestions);
@@ -836,6 +951,7 @@ async function oneStep(
         ctx.ui.notify(`dev-loop: openspec archive failed: ${stderr}; stopping (PR + worktree left)`, "warning");
         persist(); return "stop";
       }
+      if (!s.oneOff) markChangeDone(wtDir, change); // flip TODO.md so the archive commit carries it
       const { stdout: dirty } = await run(pi, "git", ["status", "--porcelain"], wtDir);
       if (dirty) {
         await run(pi, "git", ["add", "-A"], wtDir);
@@ -863,6 +979,7 @@ async function oneStep(
 
   if (s.phase === PHASE.CLEANUP) {
     await removeWorktree(pi, repoRoot, change);
+    await syncMain(pi, ctx, repoRoot);
     return "done";
   }
 
@@ -874,21 +991,32 @@ async function driveChange(
   pi: ExtensionAPI,
   ctx: any,
   change: string,
-  dryRun: boolean
+  dryRun: boolean,
+  oneOff: boolean
 ): Promise<"completed" | "suspended" | "stopped" | "aborted"> {
   const repoRoot = ctx.cwd as string;
   let s = readLoopState(repoRoot, change);
-  if (!s || s.phase === PHASE.RESOLVE || s.phase === PHASE.PROVISION || s.phase === PHASE.BUILD) {
+  // RESOLVE/PROVISION/no-state: re-derive via runPrefix. BUILD is now a persisted
+  // inner machine handled by oneStep, so a crashed BUILD state resumes there.
+  if (!s || s.phase === PHASE.RESOLVE || s.phase === PHASE.PROVISION) {
     const r = await runPrefix(pi, ctx, change, dryRun);
-    if (r.kind === "stop") return "stopped";
     if (r.kind === "merged") return "completed";
-    if (r.kind !== "atReview") return "aborted";
-    s = {
-      phase: PHASE.REVIEW, inner: REVIEW_INNER.RECONCILE, round: 1,
-      prNum: r.prNum, head: r.head, repo: r.repo,
-      triggerAt: null, reviewDeadline: null, seenSignatures: [], suggestions: [], stopReason: null,
-    };
-    writeLoopState(repoRoot, change, s);
+    if (r.kind === "dryRun" || r.kind === "abort") return "aborted";
+    if (r.kind === "atReview") {
+      s = {
+        phase: PHASE.REVIEW, inner: REVIEW_INNER.RECONCILE, round: 1,
+        prNum: r.prNum, head: r.head, repo: r.repo,
+        triggerAt: null, reviewDeadline: null, seenSignatures: [], suggestions: [], stopReason: null, oneOff,
+      };
+      writeLoopState(repoRoot, change, s);
+    } else if (r.kind === "atBuild") {
+      s = {
+        phase: PHASE.BUILD, inner: BUILD_INNER.IMPLEMENT, round: 0,
+        prNum: 0, head: "", repo: r.repo,
+        triggerAt: null, reviewDeadline: null, seenSignatures: [], suggestions: [], stopReason: null, oneOff,
+      };
+      writeLoopState(repoRoot, change, s);
+    }
   }
   while (true) {
     if (stopRequested) { s.stopReason = "stopped"; writeLoopState(repoRoot, change, s); return "stopped"; }
@@ -920,10 +1048,9 @@ async function runLoopChain(): Promise<void> {
         loopActive = false; stopSentinelTicker(); runCtx = null;
         return;
       }
-      const outcome = await driveChange(pi, ctx, runCtx.change, runCtx.dryRun);
+      const outcome = await driveChange(pi, ctx, runCtx.change, runCtx.dryRun, runCtx.oneOff);
       if (outcome === "suspended") return;             // review_wait; timer re-enters
       if (outcome === "completed") {
-        if (!runCtx.oneOff) markChangeDone(ctx.cwd as string, runCtx.change);
         clearLoopState(ctx.cwd as string, runCtx.change);
         ctx.ui.notify(`dev-loop: "${runCtx.change}" merged ✅`, "info");
         if (runCtx.all && !runCtx.oneOff) {
@@ -967,8 +1094,10 @@ async function initProject(pi: ExtensionAPI, ctx: any) {
     ctx.ui.notify("dev-loop: created TODO.md", "info");
   }
 
-  // 2. Keep TODO.md + .worktree/ out of git via the local-only exclude.
-  await ensureLocalIgnore(pi, cwd, "TODO.md");
+  // 2. TODO.md is a tracked file (its `- [x]` flips propagate through each
+  //    change's PR); drop any stale local-ignore a prior init may have added.
+  //    .worktree/ stays local-only.
+  await removeFromLocalIgnore(pi, cwd, "TODO.md");
   await ensureLocalIgnore(pi, cwd, `${WORKTREE_ROOT}/`);
 
   // 3. OpenSpec scaffolding, non-interactive and pi-targeted.
@@ -1005,7 +1134,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.registerCommand("loop", {
     description:
-      "Autonomous OpenSpec-change → worktree → PR → Codex review → archive → merge loop. Subcommands: stop | fetch | resume. Flags: --dry-run --all",
+      "Autonomous OpenSpec-change → worktree → PR → Codex review → archive → merge loop. Subcommands: stop | fetch | resume | status. Flags: --dry-run --all",
     handler: async (args, ctx) => {
       const argv = String(args ?? "").trim();
       const tokens = argv.split(/\s+/).filter(Boolean);
@@ -1025,6 +1154,36 @@ export default function (pi: ExtensionAPI) {
       }
       if (sub === "fetch") {
         writeControl(ctx, FETCH_SENTINEL, "fetch");
+        return;
+      }
+      if (sub === "status") {
+        // Read-only snapshot of every persisted loop state. Scans disk (not the
+        // in-memory interruptedChange) so it still finds a change left stuck by
+        // a crash/restart — which is the whole reason stopReason is persisted.
+        const cwd = ctx.cwd as string;
+        const wtRoot = join(cwd, WORKTREE_ROOT);
+        const found: { change: string; s: LoopState }[] = [];
+        if (existsSync(wtRoot)) {
+          for (const d of readdirSync(wtRoot, { withFileTypes: true })) {
+            if (!d.isDirectory()) continue;
+            const s = readLoopState(cwd, d.name);
+            if (s) found.push({ change: d.name, s });
+          }
+        }
+        if (!found.length) {
+          ctx.ui.notify("dev-loop: no loop state — nothing running, nothing stopped", "info");
+          return;
+        }
+        for (const { change, s } of found) {
+          const running = loopActive && runCtx?.change === change;
+          const tag = running ? "RUNNING" : s.stopReason ? `STOPPED (${s.stopReason})` : "idle";
+          ctx.ui.notify(
+            `dev-loop: "${change}" — ${tag}\n` +
+            `  phase ${s.phase}${s.inner ? ` / inner ${s.inner}` : ""} · round ${s.round}\n` +
+            `  PR #${s.prNum} @ ${shortSha(s.head)} (${s.repo})`,
+            running ? "info" : s.stopReason ? "warning" : "info",
+          );
+        }
         return;
       }
       if (sub === "resume") {
