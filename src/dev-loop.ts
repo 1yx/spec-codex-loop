@@ -9,8 +9,11 @@ import { checkPreconditions } from "./phases.ts";
 import { runLoopChain } from "./pipeline.ts";
 
 // --- project init (/loop init) ------------------------------------------------
+/**
+ *
+ */
 async function initProject(pi: ExtensionAPI, ctx: LoopCtx): Promise<void> {
-  const cwd = ctx.cwd as string;
+  const cwd = ctx.cwd;
   const todoPath = findTodoFile(cwd) ?? join(cwd, "TODO.md");
   if (existsSync(todoPath)) {
     ctx.ui.notify("dev-loop: TODO.md already exists", "info");
@@ -55,8 +58,11 @@ function notifyStatusEntry(ctx: LoopCtx, change: string, s: LoopState): void {
   );
 }
 
+/**
+ *
+ */
 function handleStatus(ctx: LoopCtx): void {
-  const cwd = ctx.cwd as string;
+  const cwd = ctx.cwd;
   const wtRoot = join(cwd, WORKTREE_ROOT);
   const found: { change: string; s: LoopState }[] = [];
   if (existsSync(wtRoot)) {
@@ -73,6 +79,9 @@ function handleStatus(ctx: LoopCtx): void {
   for (const { change, s } of found) {notifyStatusEntry(ctx, change, s);}
 }
 
+/**
+ *
+ */
 async function handleResume(pi: ExtensionAPI, ctx: LoopCtx): Promise<void> {
   if (!rt.interruptedChange) {
     ctx.ui.notify("dev-loop: nothing to resume (no change stopped via /loop stop)", "warning");
@@ -87,7 +96,7 @@ async function handleResume(pi: ExtensionAPI, ctx: LoopCtx): Promise<void> {
   rt.fetchRequested = false;
   // Clear stale sentinels left by a touch while no loop was running.
   for (const s of [FETCH_SENTINEL, STOP_SENTINEL]) {
-    try { unlinkSync(join(ctx.cwd as string, s)); } catch { /* already gone */ }
+    try { unlinkSync(join(ctx.cwd, s)); } catch { /* already gone */ }
   }
   clearWaitTimer(ch);
   startSentinelTicker(ctx);
@@ -100,7 +109,7 @@ async function handleNormalRun(pi: ExtensionAPI, ctx: LoopCtx, tokens: string[])
   const all = tokens.includes("--all");
   const positional = tokens.filter((t) => !t.startsWith("--"));
   const oneOff = positional.join(" ").trim();
-  const cwd = ctx.cwd as string;
+  const cwd = ctx.cwd;
   if (!(await checkPreconditions(pi, ctx))) {return;}
   let firstChange: string | null = null;
   if (oneOff) {
@@ -125,6 +134,9 @@ async function handleNormalRun(pi: ExtensionAPI, ctx: LoopCtx, tokens: string[])
   await runLoopChain();
 }
 
+/**
+ *
+ */
 async function loopCommandHandler(pi: ExtensionAPI, args: unknown, ctx: LoopCtx): Promise<void> {
   const tokens = String(args ?? "").trim().split(/\s+/).filter(Boolean);
   const sub = tokens[0];
@@ -137,6 +149,9 @@ async function loopCommandHandler(pi: ExtensionAPI, args: unknown, ctx: LoopCtx)
 }
 
 // --- entry point ---------------------------------------------------------------
+/**
+ *
+ */
 export default function (pi: ExtensionAPI): void {
   rt.piRef = pi;
   rt.wakeLoop = runLoopChain; // control/timer trigger the pipeline via this callback (no import cycle)

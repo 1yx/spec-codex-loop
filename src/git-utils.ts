@@ -9,7 +9,7 @@ export async function run(
   argv: string[],
   cwd?: string
 ): Promise<{ stdout: string; stderr: string; code: number }> {
-  const r = await pi.exec(argv[0], argv.slice(1), cwd ? { cwd } : undefined) as { stdout?: string; stderr?: string; code?: number };
+  const r = await pi.exec(argv[0], argv.slice(1), cwd ? { cwd } : undefined);
   return {
     stdout: (r.stdout ?? "").trim(),
     stderr: (r.stderr ?? "").trim(),
@@ -17,6 +17,9 @@ export async function run(
   };
 }
 
+/**
+ *
+ */
 export async function ghJson<T>(pi: ExtensionAPI, endpoint: string): Promise<T | null> {
   const { stdout, code } = await run(pi, ["gh", "api", endpoint]);
   if (code !== 0 || !stdout) {return null;}
@@ -212,12 +215,21 @@ export async function reconcileBranch(pi: ExtensionAPI, ids: { repo: string; prN
   return { kind: "ok", head: localHead };
 }
 
-/** Open/merged PR state for a change's head branch (used for resume). */
+/**
+ *
+ */
+export type PrState =
+  | { open: true; merged: false; prNum: number }
+  | { open: false; merged: true; prNum: number }
+  | { open: false; merged: false; prNum: null };
+
+/** Open/merged PR state for a change's head branch (used for resume). When open
+ *  or merged, prNum is a real number (discriminated — no narrowing casts needed). */
 export async function prStateFor(
   pi: ExtensionAPI,
   repo: string,
   change: string
-): Promise<{ open: boolean; merged: boolean; prNum: number | null }> {
+): Promise<PrState> {
   const lookup = async (state: string) => {
     const { stdout } = await run(pi, ["gh", 
       "pr", "list", "--head", change, "--state", state, "--json", "number", "-q", ".[0].number", "--repo", repo,

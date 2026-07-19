@@ -32,8 +32,14 @@ import { latestCommentAt, readCodexVerdict, shortSha, suggestionKey } from "./co
 import { buildImplement, fixPhase, resolveMainPhase } from "./phases.ts";
 import { clearLoopState, readLoopState, scheduleWait, stopSentinelTicker, waitAction, writeLoopState } from "./control.ts";
 
+/**
+ *
+ */
 type StepOutcome = "cont" | "suspend" | "done" | "stop";
 
+/**
+ *
+ */
 type PrefixResult =
   | { kind: "atReview"; prNum: number; head: string; repo: string }
   | { kind: "atBuild"; repo: string }
@@ -124,7 +130,7 @@ export async function runPrefix(pi: ExtensionAPI, ctx: LoopCtx, change: string):
     return { kind: "dryRun" };
   }
   if (pr.open) {
-    const prNum = pr.prNum as number;
+    const prNum = pr.prNum;
     const { stdout: head } = await run(pi, ["git", "rev-parse", "HEAD"], wtDir);
     ctx.ui.notify(`dev-loop: resuming — PR #${prNum} already open`, "info");
     return { kind: "atReview", prNum, head, repo };
@@ -133,6 +139,9 @@ export async function runPrefix(pi: ExtensionAPI, ctx: LoopCtx, change: string):
 }
 
 // --- oneStep: per-phase handlers ----------------------------------------------
+/**
+ *
+ */
 async function handleBuild(step: StepCtx): Promise<StepOutcome> {
   const { pi, ctx, change, s, wtDir, persist } = step;
   if (s.inner === BUILD_INNER.IMPLEMENT) {
@@ -170,7 +179,7 @@ async function handleBuild(step: StepCtx): Promise<StepOutcome> {
       persist(); return "stop";
     }
     const { stdout: head } = await run(pi, ["git", "rev-parse", "HEAD"], wtDir);
-    s.prNum = pr.prNum as number; s.head = head;
+    s.prNum = pr.prNum; s.head = head;
     s.phase = PHASE.REVIEW; s.inner = REVIEW_INNER.RECONCILE; s.round = 1;
     ctx.ui.notify(`dev-loop: PR #${s.prNum} — starting Codex review loop`, "info");
     persist(); return "cont";
@@ -178,9 +187,12 @@ async function handleBuild(step: StepCtx): Promise<StepOutcome> {
   s.stopReason = "bad_state"; persist(); return "stop";
 }
 
+/**
+ *
+ */
 async function handleReconcile(step: StepCtx): Promise<StepOutcome> {
   const { pi, ctx, change, s, wtDir, persist } = step;
-  switch (waitAction(rt.fetchRequested, s.reviewDeadline, Date.now())) {
+  switch (waitAction(rt.fetchRequested, s.reviewDeadline, Temporal.Now.instant().epochMilliseconds)) {
     case "recheck":
       rt.fetchRequested = false;
       ctx.ui.notify("dev-loop: fetch — rechecking Codex now", "info");
@@ -222,6 +234,9 @@ async function handleReconcile(step: StepCtx): Promise<StepOutcome> {
   s.inner = REVIEW_INNER.PROBE; persist(); return "cont";
 }
 
+/**
+ *
+ */
 async function handleResolveMain(step: StepCtx): Promise<StepOutcome> {
   const { pi, ctx, change, s, wtDir, persist } = step;
   await resolveMainPhase({ pi, ctx, change, wtDir });
@@ -241,6 +256,9 @@ async function handleResolveMain(step: StepCtx): Promise<StepOutcome> {
   s.inner = REVIEW_INNER.RECONCILE; persist(); return "cont";
 }
 
+/**
+ *
+ */
 async function handleProbe(step: StepCtx): Promise<StepOutcome> {
   const { pi, ctx, change, s, persist } = step;
   const v = await readCodexVerdict(pi, { repo: s.repo, prNum: s.prNum, head: s.head, triggerAt: s.triggerAt });
@@ -279,6 +297,9 @@ async function handleProbe(step: StepCtx): Promise<StepOutcome> {
   s.inner = REVIEW_INNER.FIX; persist(); return "cont";
 }
 
+/**
+ *
+ */
 async function handleTrigger(step: StepCtx): Promise<StepOutcome> {
   const { pi, ctx, s, persist } = step;
   const { code, stderr } = await run(pi, ["gh", "pr", "comment", String(s.prNum), "--body", "@codex review", "--repo", s.repo]);
@@ -288,12 +309,15 @@ async function handleTrigger(step: StepCtx): Promise<StepOutcome> {
     persist(); return "stop";
   }
   s.triggerAt = await latestCommentAt(pi, s.repo, s.prNum);
-  s.reviewDeadline = Date.now() + REVIEW_TOTAL_TIMEOUT_MS;
+  s.reviewDeadline = Temporal.Now.instant().epochMilliseconds + REVIEW_TOTAL_TIMEOUT_MS;
   s.inner = REVIEW_INNER.PROBE;
   ctx.ui.notify(`dev-loop: round ${s.round} on ${shortSha(s.head)} — triggered @codex review, polling every ${REVIEW_WAIT_MS / 60000}min (≤${REVIEW_TOTAL_TIMEOUT_MS / 60000}min; touch ${FETCH_SENTINEL} to recheck)…`, "info");
   persist(); return "cont";
 }
 
+/**
+ *
+ */
 async function handleFix(step: StepCtx): Promise<StepOutcome> {
   const { pi, ctx, change, s, wtDir, persist } = step;
   const { stdout: headPre } = await run(pi, ["git", "rev-parse", "HEAD"], wtDir);
@@ -316,10 +340,13 @@ async function handleFix(step: StepCtx): Promise<StepOutcome> {
     persist(); return "stop";
   }
   s.round++;
-  s.reviewDeadline = Date.now() + REVIEW_TOTAL_TIMEOUT_MS;
+  s.reviewDeadline = Temporal.Now.instant().epochMilliseconds + REVIEW_TOTAL_TIMEOUT_MS;
   s.inner = REVIEW_INNER.RECONCILE; persist(); return "cont";
 }
 
+/**
+ *
+ */
 async function handleReview(step: StepCtx): Promise<StepOutcome> {
   const { s, persist } = step;
   switch (s.inner) {
@@ -332,6 +359,9 @@ async function handleReview(step: StepCtx): Promise<StepOutcome> {
   }
 }
 
+/**
+ *
+ */
 async function handleArchive(step: StepCtx): Promise<StepOutcome> {
   const { pi, ctx, change, s, wtDir, persist } = step;
   const wtChangeDir = join(wtDir, "openspec", "changes", change);
@@ -358,6 +388,9 @@ async function handleArchive(step: StepCtx): Promise<StepOutcome> {
   s.phase = PHASE.MERGE; persist(); return "cont";
 }
 
+/**
+ *
+ */
 async function handleMerge(step: StepCtx): Promise<StepOutcome> {
   const { pi, ctx, s, persist } = step;
   const { code, stderr } = await run(pi, ["gh", "pr", "merge", String(s.prNum), "--squash", "--delete-branch", "--repo", s.repo]);
@@ -369,6 +402,9 @@ async function handleMerge(step: StepCtx): Promise<StepOutcome> {
   s.phase = PHASE.CLEANUP; persist(); return "cont";
 }
 
+/**
+ *
+ */
 async function handleCleanup(step: StepCtx): Promise<StepOutcome> {
   const { pi, ctx, change } = step;
   await removeWorktree(pi, ctx.cwd, change);
@@ -387,14 +423,23 @@ export async function oneStep(step: StepCtx): Promise<StepOutcome> {
   s.stopReason = "bad_state"; persist(); return "stop";
 }
 
+/**
+ *
+ */
 type InitState = { s: LoopState } | "completed" | "aborted";
 
+/**
+ *
+ */
 function seedFromPrefix(r: PrefixResult, oneOff: boolean): LoopState | null {
   if (r.kind === "atReview") {return { phase: PHASE.REVIEW, inner: REVIEW_INNER.RECONCILE, round: 1, prNum: r.prNum, head: r.head, repo: r.repo, triggerAt: null, reviewDeadline: null, seenSignatures: [], suggestions: [], stopReason: null, oneOff };}
   if (r.kind === "atBuild") {return { phase: PHASE.BUILD, inner: BUILD_INNER.IMPLEMENT, round: 0, prNum: 0, head: "", repo: r.repo, triggerAt: null, reviewDeadline: null, seenSignatures: [], suggestions: [], stopReason: null, oneOff };}
   return null;
 }
 
+/**
+ *
+ */
 async function rederiveState(pi: ExtensionAPI, ctx: LoopCtx, change: string): Promise<InitState> {
   const r = await runPrefix(pi, ctx, change);
   if (r.kind === "merged") {return "completed";}
@@ -445,11 +490,17 @@ function handleCompleted(ctx: LoopCtx): "chain" | "done" {
   return "done";
 }
 
+/**
+ *
+ */
 function endChain(change: string, stopped: boolean): void {
   if (stopped) {rt.interruptedChange = change;}
   rt.loopActive = false; stopSentinelTicker(); rt.runCtx = null;
 }
 
+/**
+ *
+ */
 export async function runLoopChain(): Promise<void> {
   if (!rt.piRef || !rt.runCtx || rt.stepping) {return;}
   const pi = rt.piRef;

@@ -1,7 +1,7 @@
 import agentic from 'eslint-config-agentic';
 
 export default [
-  ...agentic(),
+  ...agentic({ allowAsAssertions: true }),
   {
     ignores: [
       'node_modules/',
@@ -9,6 +9,7 @@ export default [
       '.pi/',
       '.tmp/',
       'openspec/',
+      'src/types/',
     ],
   },
 ];

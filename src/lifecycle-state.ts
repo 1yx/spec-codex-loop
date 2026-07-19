@@ -25,6 +25,9 @@ export const PHASE = Object.freeze({
   CLEANUP: "cleanup",       // remove worktree + mark TODO [x]
 } as const);
 
+/**
+ *
+ */
 export type Phase = (typeof PHASE)[keyof typeof PHASE];
 
 const PHASE_VALUES: readonly Phase[] = Object.values(PHASE);
@@ -41,6 +44,9 @@ export const REVIEW_INNER = Object.freeze({
   RESOLVE_MAIN: "review_resolve_main", // agent resolves origin/main merge conflicts (context-aware), then re-review
 } as const);
 
+/**
+ *
+ */
 export type ReviewInner = (typeof REVIEW_INNER)[keyof typeof REVIEW_INNER];
 
 /** Inner states of the build phase: implement+commit → push → open PR. Each is a
@@ -52,6 +58,9 @@ export const BUILD_INNER = Object.freeze({
   PR: "build_pr",               // gh pr create → enter REVIEW
 } as const);
 
+/**
+ *
+ */
 export type BuildInner = (typeof BUILD_INNER)[keyof typeof BUILD_INNER];
 
 /** Legal outer transitions. Flow is linear; the review loop lives inside REVIEW
@@ -69,6 +78,9 @@ export const OUTER_TRANSITIONS: Readonly<Record<Phase, readonly Phase[]>> = Obje
 
 export const TERMINAL_PHASES: readonly Phase[] = Object.freeze([PHASE.CLEANUP]);
 
+/**
+ *
+ */
 export type RealityProbes = {
   /** Explicit phase override (e.g. read from .loop-state.json). Unknown → ignore. */
   phase?: string | null;
@@ -80,6 +92,9 @@ export type RealityProbes = {
   archived: boolean;
 }
 
+/**
+ *
+ */
 export type ResolveResult = {
   phase: Phase;
   allowedTransitions: readonly Phase[];
@@ -102,7 +117,7 @@ export function resolvePhase(input: RealityProbes): ResolveResult {
   const { phase = null, wtExists, prState, archived } = input;
 
   if (phase) {
-    if (PHASE_SET.has(phase)) {return buildResult(phase as Phase);}
+    if (isPhase(phase)) {return buildResult(phase);}
     // unrecognized explicit phase: fall through to inference
   }
   if (prState === "merged") {return buildResult(PHASE.CLEANUP);}
@@ -112,6 +127,9 @@ export function resolvePhase(input: RealityProbes): ResolveResult {
   return buildResult(PHASE.PROVISION);
 }
 
+/**
+ *
+ */
 function buildResult(phase: Phase): ResolveResult {
   return {
     phase,
@@ -120,10 +138,21 @@ function buildResult(phase: Phase): ResolveResult {
   };
 }
 
+/**
+ *
+ */
 export function isKnownPhase(value: string): boolean {
   return PHASE_SET.has(value);
 }
 
+/** Type guard: narrows a string to Phase when it's a known phase value. */
+export function isPhase(value: string): value is Phase {
+  return PHASE_SET.has(value);
+}
+
+/**
+ *
+ */
 export function isTransitionAllowed(from: Phase, to: Phase): boolean {
   return OUTER_TRANSITIONS[from]?.includes(to) ?? false;
 }

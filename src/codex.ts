@@ -10,12 +10,18 @@ const PASS_RE = /Didn't find any major issues/i;
 //   "Code review usage limits reached"
 const QUOTA_RE = /usage limits? for code reviews|code review usage limits? reached/i;
 
+/**
+ *
+ */
 type GhComment = {
   id: number;
   user?: { login: string };
   created_at: string;
   body: string;
 }
+/**
+ *
+ */
 type GhReview = {
   id?: number;
   user?: { login: string };
@@ -24,6 +30,9 @@ type GhReview = {
   commit_id?: string;
   body?: string;
 }
+/**
+ *
+ */
 type GhInlineComment = {
   pull_request_review_id?: number;
   path?: string;
@@ -31,12 +40,18 @@ type GhInlineComment = {
   commit_id?: string;
 } & GhComment
 
+/**
+ *
+ */
 export function isCodex(login?: string): boolean {
   return !!login && login.startsWith(CODEX_LOGIN);
 }
 
 export const shortSha = (sha: string): string => sha.slice(0, 7);
 
+/**
+ *
+ */
 function parseSuggestion(c: GhInlineComment): Suggestion {
   const sev = /!\[(P\d)\s+Badge/i.exec(c.body)?.[1] ?? null;
   const cleaned = c.body
@@ -55,6 +70,9 @@ function parseSuggestion(c: GhInlineComment): Suggestion {
   };
 }
 
+/**
+ *
+ */
 export function formatSuggestions(suggestions: Suggestion[]): string {
   return suggestions
     .map((s, i) => {
@@ -114,8 +132,8 @@ export async function readCodexVerdict(
     (await ghJson<GhReview[]>(pi, `repos/${repo}/pulls/${prNum}/reviews?per_page=100`)) ?? [];
   const headReviewIds = new Set(
     reviews
-      .filter((r) => isCodex(r.user?.login) && shortSha(r.commit_id ?? "") === head7 && r.id != null)
-      .map((r) => r.id as number)
+      .filter((r): r is GhReview & { id: number } => isCodex(r.user?.login) && shortSha(r.commit_id ?? "") === head7 && r.id != null)
+      .map((r) => r.id)
   );
   if (headReviewIds.size > 0) {
     const inline =

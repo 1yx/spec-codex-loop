@@ -8,11 +8,12 @@
   ],
   "pi": {
     "extensions": [
-      "./dev-loop.ts"
+      "./src/dev-loop.ts"
     ]
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "^0.80.10",
+    "@js-temporal/polyfill": "^0.5.1",
     "@types/node": "^26.1.1",
     "eslint": "^10.7.0",
     "eslint-config-agentic": "github:1yx/eslint-config-agentic",

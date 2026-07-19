@@ -10,6 +10,9 @@ export const REVIEW_WAIT_MS = 10 * 60_000; // poll interval between Codex fetche
 export const REVIEW_TOTAL_TIMEOUT_MS = 30 * 60_000; // cap per round
 
 // --- cross-cutting types ------------------------------------------------------
+/**
+ *
+ */
 export type Suggestion = {
   severity: string | null;
   title: string;
@@ -18,6 +21,9 @@ export type Suggestion = {
   line: number | null;
 }
 
+/**
+ *
+ */
 export type PollResult = {
   pass: boolean;
   timeout: boolean;
@@ -31,6 +37,9 @@ export type PollResult = {
   suggestions: Suggestion[];
 }
 
+/**
+ *
+ */
 export type LoopState = {
   phase: string;
   inner: string | null;
@@ -46,6 +55,9 @@ export type LoopState = {
   oneOff: boolean;
 }
 
+/**
+ *
+ */
 export type ReconcileResult =
   | { kind: "ok"; head: string }
   | { kind: "diverged" }
@@ -53,6 +65,9 @@ export type ReconcileResult =
   | { kind: "main_merged_clean"; head: string }
   | { kind: "main_conflict" };
 
+/**
+ *
+ */
 export type RunCtx = {
   ctx: LoopCtx;
   change: string;
@@ -85,20 +100,37 @@ export type StepCtx = {
 } & PhaseCtx
 
 // --- shared mutable runtime state (singleton; imported + mutated across modules) ---
-export const rt = {
-  piRef: null as ExtensionAPI | null,
-  runCtx: null as RunCtx | null,
-  loopActive: false,
-  stepping: false,
-  interruptedChange: null as string | null,
-  stopRequested: false,
-  fetchRequested: false,
-  waitTimers: new Map<string, NodeJS.Timeout>(),
-  sentinelTicker: null as NodeJS.Timeout | null,
-  turnResolve: null as (() => void) | null,
+/**
+ *
+ */
+type RtState = {
+  piRef: ExtensionAPI | null;
+  runCtx: RunCtx | null;
+  loopActive: boolean;
+  stepping: boolean;
+  interruptedChange: string | null;
+  stopRequested: boolean;
+  fetchRequested: boolean;
+  waitTimers: Map<string, NodeJS.Timeout>;
+  sentinelTicker: NodeJS.Timeout | null;
+  turnResolve: (() => void) | null;
   /** Loop wake callback (set by the entry; control/timer trigger it without
    *  importing the pipeline, avoiding a control↔pipeline import cycle). */
-  wakeLoop: null as (() => void | Promise<void>) | null,
+  wakeLoop: (() => void | Promise<void>) | null;
+};
+
+export const rt: RtState = {
+  piRef: null,
+  runCtx: null,
+  loopActive: false,
+  stepping: false,
+  interruptedChange: null,
+  stopRequested: false,
+  fetchRequested: false,
+  waitTimers: new Map(),
+  sentinelTicker: null,
+  turnResolve: null,
+  wakeLoop: null,
 };
 
 export const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));

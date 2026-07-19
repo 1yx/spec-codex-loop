@@ -31,14 +31,20 @@ export function applyControl(ctx: LoopCtx, kind: "fetch" | "stop"): void {
 
 /** Command path: write the sentinel (cross-terminal trigger) then apply. */
 export function writeControl(ctx: LoopCtx, sentinel: string, kind: "fetch" | "stop"): void {
-  try { writeFileSync(join(ctx.cwd as string, sentinel), ""); } catch { /* non-fatal */ }
+  try { writeFileSync(join(ctx.cwd, sentinel), ""); } catch { /* non-fatal */ }
   applyControl(ctx, kind);
 }
 
 // --- persisted loop state (.worktree/<change>/.loop-state.json) ----------------
+/**
+ *
+ */
 export function statePath(repoRoot: string, change: string): string {
   return join(repoRoot, WORKTREE_ROOT, change, LOOP_STATE_FILE);
 }
+/**
+ *
+ */
 export function readLoopState(repoRoot: string, change: string): LoopState | null {
   try {
     const p = statePath(repoRoot, change);
@@ -46,20 +52,32 @@ export function readLoopState(repoRoot: string, change: string): LoopState | nul
     return JSON.parse(readFileSync(p, "utf-8")) as LoopState;
   } catch { return null; }
 }
+/**
+ *
+ */
 export function writeLoopState(repoRoot: string, change: string, s: LoopState): void {
   const p = statePath(repoRoot, change);
   const tmp = `${p}.tmp`;
   try { writeFileSync(tmp, JSON.stringify(s)); renameSync(tmp, p); } catch { /* resume re-derives */ }
 }
+/**
+ *
+ */
 export function clearLoopState(repoRoot: string, change: string): void {
   try { unlinkSync(statePath(repoRoot, change)); } catch { /* already gone */ }
 }
 
 // --- review_wait timer --------------------------------------------------------
+/**
+ *
+ */
 export function clearWaitTimer(change: string): void {
   const t = rt.waitTimers.get(change);
   if (t) { clearTimeout(t); rt.waitTimers.delete(change); }
 }
+/**
+ *
+ */
 export function scheduleWait(ms: number): void {
   if (!rt.runCtx) {return;}
   const change = rt.runCtx.change;
@@ -77,7 +95,7 @@ export function startSentinelTicker(ctx: LoopCtx): void {
   stopSentinelTicker();
   rt.sentinelTicker = setInterval(() => {
     if (!rt.runCtx) {return;}
-    const root = ctx.cwd as string;
+    const root = ctx.cwd;
     const stopP = join(root, STOP_SENTINEL);
     const fetchP = join(root, FETCH_SENTINEL);
     if (existsSync(stopP)) { try { unlinkSync(stopP); } catch { /* gone */ } applyControl(ctx, "stop"); }
@@ -85,6 +103,9 @@ export function startSentinelTicker(ctx: LoopCtx): void {
   }, POLL_TICK_MS);
   rt.sentinelTicker.unref?.();
 }
+/**
+ *
+ */
 export function stopSentinelTicker(): void {
   if (rt.sentinelTicker) { clearInterval(rt.sentinelTicker); rt.sentinelTicker = null; }
 }

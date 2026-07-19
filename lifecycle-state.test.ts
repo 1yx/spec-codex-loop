@@ -1,7 +1,7 @@
 // Unit tests for lifecycle-state.ts. Run directly: node lifecycle-state.test.ts
 // Cases derived from runTask's actual resume branches (the logic this formalizes).
 import assert from "node:assert/strict";
-import { PHASE, resolvePhase, isKnownPhase, isTransitionAllowed, OUTER_TRANSITIONS } from "./lifecycle-state.ts";
+import { PHASE, resolvePhase, isKnownPhase, isTransitionAllowed, OUTER_TRANSITIONS } from "./src/lifecycle-state.ts";
 
 let passed = 0;
 const check = (name: string, cond: boolean) => { assert.ok(cond, name); passed++; console.log(`  ✓ ${name}`); };
