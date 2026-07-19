@@ -18,7 +18,7 @@ export async function run(
 }
 
 /**
- *
+ * GET a GitHub API endpoint as parsed JSON, or null on error/empty.
  */
 export async function ghJson<T>(pi: ExtensionAPI, endpoint: string): Promise<T | null> {
   const { stdout, code } = await run(pi, ["gh", "api", endpoint]);
@@ -216,7 +216,8 @@ export async function reconcileBranch(pi: ExtensionAPI, ids: { repo: string; prN
 }
 
 /**
- *
+ * Discriminated PR state for a change branch — when open/merged, prNum is a real number
+ * (so callers narrow without a cast after checking `open`/`merged`).
  */
 export type PrState =
   | { open: true; merged: false; prNum: number }

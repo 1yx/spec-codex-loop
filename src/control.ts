@@ -37,13 +37,13 @@ export function writeControl(ctx: LoopCtx, sentinel: string, kind: "fetch" | "st
 
 // --- persisted loop state (.worktree/<change>/.loop-state.json) ----------------
 /**
- *
+ * Path to a change's persisted loop-state file.
  */
 export function statePath(repoRoot: string, change: string): string {
   return join(repoRoot, WORKTREE_ROOT, change, LOOP_STATE_FILE);
 }
 /**
- *
+ * Read a change's persisted loop state, or null if absent/corrupt.
  */
 export function readLoopState(repoRoot: string, change: string): LoopState | null {
   try {
@@ -53,7 +53,7 @@ export function readLoopState(repoRoot: string, change: string): LoopState | nul
   } catch { return null; }
 }
 /**
- *
+ * Persist a change's loop state (atomic temp-file rename).
  */
 export function writeLoopState(repoRoot: string, change: string, s: LoopState): void {
   const p = statePath(repoRoot, change);
@@ -61,7 +61,7 @@ export function writeLoopState(repoRoot: string, change: string, s: LoopState): 
   try { writeFileSync(tmp, JSON.stringify(s)); renameSync(tmp, p); } catch { /* resume re-derives */ }
 }
 /**
- *
+ * Delete a change's persisted loop state (after a clean merge).
  */
 export function clearLoopState(repoRoot: string, change: string): void {
   try { unlinkSync(statePath(repoRoot, change)); } catch { /* already gone */ }
@@ -69,14 +69,14 @@ export function clearLoopState(repoRoot: string, change: string): void {
 
 // --- review_wait timer --------------------------------------------------------
 /**
- *
+ * Cancel a change's pending review_wait timer, if any.
  */
 export function clearWaitTimer(change: string): void {
   const t = rt.waitTimers.get(change);
   if (t) { clearTimeout(t); rt.waitTimers.delete(change); }
 }
 /**
- *
+ * Schedule a review_wait re-probe after `ms`; replaces any pending timer for the run's change.
  */
 export function scheduleWait(ms: number): void {
   if (!rt.runCtx) {return;}
@@ -104,7 +104,7 @@ export function startSentinelTicker(ctx: LoopCtx): void {
   rt.sentinelTicker.unref?.();
 }
 /**
- *
+ * Stop the cross-terminal sentinel ticker.
  */
 export function stopSentinelTicker(): void {
   if (rt.sentinelTicker) { clearInterval(rt.sentinelTicker); rt.sentinelTicker = null; }

@@ -26,7 +26,7 @@ export const PHASE = Object.freeze({
 } as const);
 
 /**
- *
+ * Outer lifecycle phase (resolve → provision → build → review → archive → merge → cleanup).
  */
 export type Phase = (typeof PHASE)[keyof typeof PHASE];
 
@@ -45,7 +45,7 @@ export const REVIEW_INNER = Object.freeze({
 } as const);
 
 /**
- *
+ * Inner sub-state of the REVIEW phase (reconcile/probe/trigger/fix/resolve-main).
  */
 export type ReviewInner = (typeof REVIEW_INNER)[keyof typeof REVIEW_INNER];
 
@@ -59,7 +59,7 @@ export const BUILD_INNER = Object.freeze({
 } as const);
 
 /**
- *
+ * Inner sub-state of the BUILD phase (implement/push/pr).
  */
 export type BuildInner = (typeof BUILD_INNER)[keyof typeof BUILD_INNER];
 
@@ -79,7 +79,7 @@ export const OUTER_TRANSITIONS: Readonly<Record<Phase, readonly Phase[]>> = Obje
 export const TERMINAL_PHASES: readonly Phase[] = Object.freeze([PHASE.CLEANUP]);
 
 /**
- *
+ * Authoritative reality signals used to (re)derive the entry phase on resume.
  */
 export type RealityProbes = {
   /** Explicit phase override (e.g. read from .loop-state.json). Unknown → ignore. */
@@ -93,7 +93,7 @@ export type RealityProbes = {
 }
 
 /**
- *
+ * Outcome of resolvePhase: the phase to (re)enter plus its graph metadata.
  */
 export type ResolveResult = {
   phase: Phase;
@@ -128,7 +128,7 @@ export function resolvePhase(input: RealityProbes): ResolveResult {
 }
 
 /**
- *
+ * Build a ResolveResult for a phase (its allowed transitions + terminality).
  */
 function buildResult(phase: Phase): ResolveResult {
   return {
@@ -139,7 +139,7 @@ function buildResult(phase: Phase): ResolveResult {
 }
 
 /**
- *
+ * True if `value` is a recognized outer phase.
  */
 export function isKnownPhase(value: string): boolean {
   return PHASE_SET.has(value);
@@ -151,7 +151,7 @@ export function isPhase(value: string): value is Phase {
 }
 
 /**
- *
+ * True if the outer transition graph permits from→to.
  */
 export function isTransitionAllowed(from: Phase, to: Phase): boolean {
   return OUTER_TRANSITIONS[from]?.includes(to) ?? false;

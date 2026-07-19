@@ -11,7 +11,7 @@ const PASS_RE = /Didn't find any major issues/i;
 const QUOTA_RE = /usage limits? for code reviews|code review usage limits? reached/i;
 
 /**
- *
+ * GitHub issue/PR comment (the \@codex review trigger + verdict comments).
  */
 type GhComment = {
   id: number;
@@ -20,7 +20,7 @@ type GhComment = {
   body: string;
 }
 /**
- *
+ * GitHub PR review object (state + reviewed commit + body).
  */
 type GhReview = {
   id?: number;
@@ -31,7 +31,7 @@ type GhReview = {
   body?: string;
 }
 /**
- *
+ * GitHub PR review inline comment (scoped to its review via pull_request_review_id).
  */
 type GhInlineComment = {
   pull_request_review_id?: number;
@@ -41,7 +41,7 @@ type GhInlineComment = {
 } & GhComment
 
 /**
- *
+ * True if the comment/review author is the Codex bot.
  */
 export function isCodex(login?: string): boolean {
   return !!login && login.startsWith(CODEX_LOGIN);
@@ -50,7 +50,7 @@ export function isCodex(login?: string): boolean {
 export const shortSha = (sha: string): string => sha.slice(0, 7);
 
 /**
- *
+ * Parse a Codex inline comment into a Suggestion: strip markup, split title/body, keep location.
  */
 function parseSuggestion(c: GhInlineComment): Suggestion {
   const sev = /!\[(P\d)\s+Badge/i.exec(c.body)?.[1] ?? null;
@@ -71,7 +71,7 @@ function parseSuggestion(c: GhInlineComment): Suggestion {
 }
 
 /**
- *
+ * Format a suggestion set as the numbered list fed to the fix-phase agent prompt.
  */
 export function formatSuggestions(suggestions: Suggestion[]): string {
   return suggestions

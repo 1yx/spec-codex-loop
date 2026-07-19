@@ -11,7 +11,7 @@ export const REVIEW_TOTAL_TIMEOUT_MS = 30 * 60_000; // cap per round
 
 // --- cross-cutting types ------------------------------------------------------
 /**
- *
+ * A single parsed Codex review comment (severity, title, body, location).
  */
 export type Suggestion = {
   severity: string | null;
@@ -22,7 +22,8 @@ export type Suggestion = {
 }
 
 /**
- *
+ * Codex's verdict for a commit, plus transient-state flags
+ * (quota/unclassified) the caller acts on instead of waiting out the timeout.
  */
 export type PollResult = {
   pass: boolean;
@@ -38,7 +39,7 @@ export type PollResult = {
 }
 
 /**
- *
+ * Persisted re-entrant loop state (.worktree/<change>/.loop-state.json).
  */
 export type LoopState = {
   phase: string;
@@ -56,7 +57,8 @@ export type LoopState = {
 }
 
 /**
- *
+ * Outcome of reconcileBranch: origin/<change> divergence, origin/main merge
+ * state, or ok.
  */
 export type ReconcileResult =
   | { kind: "ok"; head: string }
@@ -66,7 +68,7 @@ export type ReconcileResult =
   | { kind: "main_conflict" };
 
 /**
- *
+ * The active run's parameters (change + flags), held in rt.runCtx while a loop is in flight.
  */
 export type RunCtx = {
   ctx: LoopCtx;
@@ -101,7 +103,7 @@ export type StepCtx = {
 
 // --- shared mutable runtime state (singleton; imported + mutated across modules) ---
 /**
- *
+ * Shape of the shared mutable `rt` singleton (cross-module loop/control state).
  */
 type RtState = {
   piRef: ExtensionAPI | null;

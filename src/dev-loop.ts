@@ -10,7 +10,7 @@ import { runLoopChain } from "./pipeline.ts";
 
 // --- project init (/loop init) ------------------------------------------------
 /**
- *
+ * `/loop init`: create TODO.md, git-ignore .worktree/, scaffold openspec.
  */
 async function initProject(pi: ExtensionAPI, ctx: LoopCtx): Promise<void> {
   const cwd = ctx.cwd;
@@ -59,7 +59,7 @@ function notifyStatusEntry(ctx: LoopCtx, change: string, s: LoopState): void {
 }
 
 /**
- *
+ * `/loop status`: scan every persisted loop state and report phase/inner/round/PR + stop reason.
  */
 function handleStatus(ctx: LoopCtx): void {
   const cwd = ctx.cwd;
@@ -80,7 +80,7 @@ function handleStatus(ctx: LoopCtx): void {
 }
 
 /**
- *
+ * `/loop resume`: re-enter the change last stopped via `/loop stop`.
  */
 async function handleResume(pi: ExtensionAPI, ctx: LoopCtx): Promise<void> {
   if (!rt.interruptedChange) {
@@ -135,7 +135,7 @@ async function handleNormalRun(pi: ExtensionAPI, ctx: LoopCtx, tokens: string[])
 }
 
 /**
- *
+ * Dispatch `/loop` subcommands: init | stop | fetch | status | resume, else a normal run.
  */
 async function loopCommandHandler(pi: ExtensionAPI, args: unknown, ctx: LoopCtx): Promise<void> {
   const tokens = String(args ?? "").trim().split(/\s+/).filter(Boolean);
@@ -148,9 +148,8 @@ async function loopCommandHandler(pi: ExtensionAPI, args: unknown, ctx: LoopCtx)
   return handleNormalRun(pi, ctx, tokens);
 }
 
-// --- entry point ---------------------------------------------------------------
 /**
- *
+ * Extension entry: wire agent_end/input listeners and register the `/loop` command.
  */
 export default function (pi: ExtensionAPI): void {
   rt.piRef = pi;

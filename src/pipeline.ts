@@ -33,12 +33,12 @@ import { buildImplement, fixPhase, resolveMainPhase } from "./phases.ts";
 import { clearLoopState, readLoopState, scheduleWait, stopSentinelTicker, waitAction, writeLoopState } from "./control.ts";
 
 /**
- *
+ * Outcome of a oneStep transition: continue / suspend (review_wait) / done / stop.
  */
 type StepOutcome = "cont" | "suspend" | "done" | "stop";
 
 /**
- *
+ * Outcome of runPrefix (resolve+provision): enter at review/build, or terminal merged/dryRun/abort.
  */
 type PrefixResult =
   | { kind: "atReview"; prNum: number; head: string; repo: string }
@@ -140,7 +140,7 @@ export async function runPrefix(pi: ExtensionAPI, ctx: LoopCtx, change: string):
 
 // --- oneStep: per-phase handlers ----------------------------------------------
 /**
- *
+ * BUILD inner: implement → push → pr (one persisted transition each).
  */
 async function handleBuild(step: StepCtx): Promise<StepOutcome> {
   const { pi, ctx, change, s, wtDir, persist } = step;
@@ -188,7 +188,7 @@ async function handleBuild(step: StepCtx): Promise<StepOutcome> {
 }
 
 /**
- *
+ * REVIEW/RECONCILE: wake-decision + sync origin/<change> + merge origin/main when behind.
  */
 async function handleReconcile(step: StepCtx): Promise<StepOutcome> {
   const { pi, ctx, change, s, wtDir, persist } = step;
@@ -235,7 +235,7 @@ async function handleReconcile(step: StepCtx): Promise<StepOutcome> {
 }
 
 /**
- *
+ * REVIEW/RESOLVE_MAIN: agent resolves origin/main conflicts using both sides' context, then re-review.
  */
 async function handleResolveMain(step: StepCtx): Promise<StepOutcome> {
   const { pi, ctx, change, s, wtDir, persist } = step;
@@ -257,7 +257,7 @@ async function handleResolveMain(step: StepCtx): Promise<StepOutcome> {
 }
 
 /**
- *
+ * REVIEW/PROBE: read Codex's verdict for the head → pass/quota/unclassified/suggestions, else sleep.
  */
 async function handleProbe(step: StepCtx): Promise<StepOutcome> {
   const { pi, ctx, change, s, persist } = step;
@@ -298,7 +298,7 @@ async function handleProbe(step: StepCtx): Promise<StepOutcome> {
 }
 
 /**
- *
+ * REVIEW/TRIGGER: post \@codex review, record triggerAt + a fresh review deadline.
  */
 async function handleTrigger(step: StepCtx): Promise<StepOutcome> {
   const { pi, ctx, s, persist } = step;
@@ -316,7 +316,7 @@ async function handleTrigger(step: StepCtx): Promise<StepOutcome> {
 }
 
 /**
- *
+ * REVIEW/FIX: agent addresses suggestions, push, round++, reset the deadline.
  */
 async function handleFix(step: StepCtx): Promise<StepOutcome> {
   const { pi, ctx, change, s, wtDir, persist } = step;
@@ -345,7 +345,7 @@ async function handleFix(step: StepCtx): Promise<StepOutcome> {
 }
 
 /**
- *
+ * REVIEW dispatch: route to the inner-state handler (reconcile/probe/trigger/fix/resolve-main).
  */
 async function handleReview(step: StepCtx): Promise<StepOutcome> {
   const { s, persist } = step;
@@ -360,7 +360,7 @@ async function handleReview(step: StepCtx): Promise<StepOutcome> {
 }
 
 /**
- *
+ * ARCHIVE: openspec archive + mark TODO [x] + commit + push.
  */
 async function handleArchive(step: StepCtx): Promise<StepOutcome> {
   const { pi, ctx, change, s, wtDir, persist } = step;
@@ -389,7 +389,7 @@ async function handleArchive(step: StepCtx): Promise<StepOutcome> {
 }
 
 /**
- *
+ * MERGE: gh pr merge --squash --delete-branch.
  */
 async function handleMerge(step: StepCtx): Promise<StepOutcome> {
   const { pi, ctx, s, persist } = step;
@@ -403,7 +403,7 @@ async function handleMerge(step: StepCtx): Promise<StepOutcome> {
 }
 
 /**
- *
+ * CLEANUP: remove worktree + sync local main (terminal).
  */
 async function handleCleanup(step: StepCtx): Promise<StepOutcome> {
   const { pi, ctx, change } = step;
@@ -424,12 +424,12 @@ export async function oneStep(step: StepCtx): Promise<StepOutcome> {
 }
 
 /**
- *
+ * resolveInitialState outcome: a LoopState to drive, or a terminal completed/aborted.
  */
 type InitState = { s: LoopState } | "completed" | "aborted";
 
 /**
- *
+ * Map an atReview/atBuild PrefixResult to the initial BUILD/REVIEW LoopState (null for terminal kinds).
  */
 function seedFromPrefix(r: PrefixResult, oneOff: boolean): LoopState | null {
   if (r.kind === "atReview") {return { phase: PHASE.REVIEW, inner: REVIEW_INNER.RECONCILE, round: 1, prNum: r.prNum, head: r.head, repo: r.repo, triggerAt: null, reviewDeadline: null, seenSignatures: [], suggestions: [], stopReason: null, oneOff };}
@@ -438,7 +438,7 @@ function seedFromPrefix(r: PrefixResult, oneOff: boolean): LoopState | null {
 }
 
 /**
- *
+ * Re-derive entry state via runPrefix when none is persisted (or at RESOLVE/PROVISION).
  */
 async function rederiveState(pi: ExtensionAPI, ctx: LoopCtx, change: string): Promise<InitState> {
   const r = await runPrefix(pi, ctx, change);
@@ -491,7 +491,7 @@ function handleCompleted(ctx: LoopCtx): "chain" | "done" {
 }
 
 /**
- *
+ * Tear down a loop chain: record interruptedChange if stopped, clear loopActive/ticker/runCtx.
  */
 function endChain(change: string, stopped: boolean): void {
   if (stopped) {rt.interruptedChange = change;}
@@ -499,7 +499,7 @@ function endChain(change: string, stopped: boolean): void {
 }
 
 /**
- *
+ * Re-entrant driver entry: walk steps until the change suspends/completes; chains --all.
  */
 export async function runLoopChain(): Promise<void> {
   if (!rt.piRef || !rt.runCtx || rt.stepping) {return;}
