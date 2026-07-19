@@ -55,7 +55,7 @@ function notifyStatusEntry(ctx: LoopCtx, change: string, s: LoopState): void {
   );
 }
 
-async function handleStatus(ctx: LoopCtx): Promise<void> {
+function handleStatus(ctx: LoopCtx): void {
   const cwd = ctx.cwd as string;
   const wtRoot = join(cwd, WORKTREE_ROOT);
   const found: { change: string; s: LoopState }[] = [];
@@ -150,7 +150,7 @@ export default function (pi: ExtensionAPI): void {
   // loopActive is true across a whole run, including the suspended review_wait
   // window (handler returned, pi back at its prompt). Free-text reaches this
   // event there; during an active agent turn it queues instead.
-  pi.on("input", async (event: { source: string }, ctx: LoopCtx) => {
+  pi.on("input", (event: { source: string }, ctx: LoopCtx) => {
     if (rt.loopActive && event.source === "interactive") {
       ctx.ui.notify("dev-loop is running — use /loop fetch | /loop stop (or touch .dev-loop-fetch / .dev-loop-stop); free-text is ignored", "info");
       return { action: "handled" };

@@ -62,7 +62,7 @@ export type RunCtx = {
 };
 
 /** The slice of pi's ExtensionContext the loop actually uses (the full type lives
- *  in the unresolvable-at-lint-time @earendil-works/pi-coding-agent package, so
+ *  in the unresolvable-at-lint-time \@earendil-works/pi-coding-agent package, so
  *  we declare the minimal structural shape to avoid `any`). */
 export type LoopCtx = {
   cwd: string;

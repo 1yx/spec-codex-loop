@@ -74,7 +74,7 @@ export function suggestionKey(suggestions: Suggestion[]): string {
 }
 
 /** SHA of the commit a Codex pass comment reviewed, parsed from its body
- *  (`**Reviewed commit:** \`<sha>\``). null if absent. */
+ *  ("Reviewed commit: <sha>"). null if absent. */
 function passCommit(body: string): string | null {
   return /Reviewed commit:\D{0,5}([0-9a-f]{7,40})/i.exec(body)?.[1] ?? null;
 }
