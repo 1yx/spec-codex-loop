@@ -1,7 +1,7 @@
 import agentic from 'eslint-config-agentic';
 
 export default [
-  ...agentic({ allowAsAssertions: true }),
+  ...agentic({ allowAsAssertions: ["JSON.parse"] }),
   {
     ignores: [
       'node_modules/',

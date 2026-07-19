@@ -22,7 +22,7 @@ importers:
         version: 10.7.0(jiti@2.7.0)
       eslint-config-agentic:
         specifier: github:1yx/eslint-config-agentic
-        version: https://codeload.github.com/1yx/eslint-config-agentic/tar.gz/775dfa7ae0e5fccb3b76b59bfb58f25662e65bb1(eslint@10.7.0(jiti@2.7.0))(typescript@5.9.3)
+        version: https://codeload.github.com/1yx/eslint-config-agentic/tar.gz/ea3a61f183a582e5f95550957aa84f0b385e9bce(eslint@10.7.0(jiti@2.7.0))(typescript@5.9.3)
       typescript:
         specifier: ^5.9.3
         version: 5.9.3
@@ -594,8 +594,8 @@ packages:
     resolution: {integrity: sha512-TtpcNJ3XAzx3Gq8sWRzJaVajRs0uVxA2YAkdb1jm2YkPz4G6egUFAyA3n5vtEIZefPk5Wa4UXbKuS5fKkJWdgA==}
     engines: {node: '>=10'}
 
-  eslint-config-agentic@https://codeload.github.com/1yx/eslint-config-agentic/tar.gz/775dfa7ae0e5fccb3b76b59bfb58f25662e65bb1:
-    resolution: {gitHosted: true, integrity: sha512-/A/QqBvNaRopkmi4ATpDp0rxxMfSSTEtGb7fKF1/sTV91KmeopDPptdoj8hNEkRrM8OPCmFfZKbwLkfwfUmxBg==, tarball: https://codeload.github.com/1yx/eslint-config-agentic/tar.gz/775dfa7ae0e5fccb3b76b59bfb58f25662e65bb1}
+  eslint-config-agentic@https://codeload.github.com/1yx/eslint-config-agentic/tar.gz/ea3a61f183a582e5f95550957aa84f0b385e9bce:
+    resolution: {gitHosted: true, tarball: https://codeload.github.com/1yx/eslint-config-agentic/tar.gz/ea3a61f183a582e5f95550957aa84f0b385e9bce}
     version: 0.2.0
     engines: {node: '>=26'}
     peerDependencies:
@@ -1844,7 +1844,7 @@ snapshots:
 
   escape-string-regexp@4.0.0: {}
 
-  eslint-config-agentic@https://codeload.github.com/1yx/eslint-config-agentic/tar.gz/775dfa7ae0e5fccb3b76b59bfb58f25662e65bb1(eslint@10.7.0(jiti@2.7.0))(typescript@5.9.3):
+  eslint-config-agentic@https://codeload.github.com/1yx/eslint-config-agentic/tar.gz/ea3a61f183a582e5f95550957aa84f0b385e9bce(eslint@10.7.0(jiti@2.7.0))(typescript@5.9.3):
     dependencies:
       '@typescript-eslint/eslint-plugin': 8.64.0(@typescript-eslint/parser@8.64.0(eslint@10.7.0(jiti@2.7.0))(typescript@5.9.3))(eslint@10.7.0(jiti@2.7.0))(typescript@5.9.3)
       '@typescript-eslint/parser': 8.64.0(eslint@10.7.0(jiti@2.7.0))(typescript@5.9.3)
