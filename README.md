@@ -26,38 +26,35 @@ A [pi](https://pi.dev) extension that runs an **autonomous spec-driven PR loop**
 
 任意 REVIEW 状态 stop(timeout / quota / codex_error / diverged / push 失败)都清 `triggerAt`+`reviewDeadline` 并留 PR+worktree,所以 `/loop resume` 会重触发 `@codex review`,不在陈旧触发上死循环。
 
-状态流转:
+状态流转 —— 外层(7 个 PHASE):
 
 ```mermaid
 stateDiagram-v2
-    state "BUILD + IMPLEMENT" as Bi
-    state "BUILD + PUSH" as Bp
-    state "BUILD + PR" as Br
-    state "REVIEW + RECONCILE" as Rr
-    state "REVIEW + RESOLVE_MAIN" as Rm
-    state "REVIEW + PROBE" as Rp
-    state "REVIEW + TRIGGER" as Rt
-    state "REVIEW + FIX" as Rf
-
     [*] --> RESOLVE
     RESOLVE --> PROVISION: fresh
     RESOLVE --> CLEANUP: already merged
-    PROVISION --> Bi
-    Bi --> Bp
-    Bp --> Br
-    Br --> Rr
-    Rr --> Rp: ok / main merged clean
-    Rr --> Rm: origin/main conflict
-    Rm --> Rr: resolved (push + re-review)
-    Rp --> Rt: no trigger yet
-    Rp --> ARCHIVE: pass / no suggestions
-    Rp --> Rf: suggestions
-    Rp --> Rr: no verdict (sleep)
-    Rt --> Rp
-    Rf --> Rr: round++ (fresh deadline)
+    PROVISION --> BUILD
+    BUILD --> REVIEW
+    REVIEW --> ARCHIVE
     ARCHIVE --> MERGE
     MERGE --> CLEANUP
     CLEANUP --> [*]
+```
+
+REVIEW 内层(进 REVIEW 必带 inner;BUILD / ARCHIVE 仅作出入口):
+
+```mermaid
+stateDiagram-v2
+    BUILD --> RECONCILE: 进入 REVIEW
+    RECONCILE --> PROBE: ok / main merged clean
+    RECONCILE --> RESOLVE_MAIN: origin/main 冲突
+    RESOLVE_MAIN --> RECONCILE: 解完(push + re-review)
+    PROBE --> TRIGGER: 还没触发
+    PROBE --> ARCHIVE: pass / 无 suggestions
+    PROBE --> FIX: 有 suggestions
+    PROBE --> RECONCILE: 无 verdict(sleep)
+    TRIGGER --> PROBE
+    FIX --> RECONCILE: round++(fresh deadline)
 ```
 
 ## Install
