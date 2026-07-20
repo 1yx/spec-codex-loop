@@ -106,6 +106,52 @@ export async function latestCommentAt(pi: ExtensionAPI, repo: string, prNum: num
   return comments[comments.length - 1]?.created_at ?? "";
 }
 
+/** True if any Codex issue comment is a pass verdict for head7. */
+function passCommentForHead(codexIssue: GhComment[], head7: string): boolean {
+  return codexIssue.some((c) => PASS_RE.test(c.body) && shortSha(passCommit(c.body) ?? "") === head7);
+}
+
+/** True if Codex gave a 👍 reaction on the PR after triggerAt (the "no issues" pass signal
+ *  when it doesn't leave a comment). Observed on endurance-race PR #22. */
+async function codexThumbsUp(pi: ExtensionAPI, v: { repo: string; prNum: number; triggerAt: string }): Promise<boolean> {
+  const reactions =
+    (await ghJson<Array<{ user?: { login: string }; content: string; created_at: string }>>(
+      pi,
+      `repos/${v.repo}/issues/${v.prNum}/reactions?per_page=100`
+    )) ?? [];
+  return reactions.some((r) => isCodex(r.user?.login) && r.content === "+1" && r.created_at > v.triggerAt);
+}
+
+/** True if a Codex quota-exhausted comment landed after triggerAt. */
+function codexQuotaAfter(codexIssue: GhComment[], triggerAt: string): boolean {
+  return codexIssue.some((c) => QUOTA_RE.test(c.body) && c.created_at > triggerAt);
+}
+
+/** True if Codex posted any issue comment after triggerAt (unclassified reply). */
+function codexReplyAfter(codexIssue: GhComment[], triggerAt: string): boolean {
+  return codexIssue.some((c) => c.created_at > triggerAt);
+}
+
+/** Read Codex's inline suggestions for head. null = no Codex review on this
+ *  commit; empty array = reviewed with no suggestions (pass); non-empty = fail. */
+async function readHeadSuggestions(pi: ExtensionAPI, ids: { repo: string; prNum: number; head7: string }): Promise<Suggestion[] | null> {
+  const { repo, prNum, head7 } = ids;
+  const reviews =
+    (await ghJson<GhReview[]>(pi, `repos/${repo}/pulls/${prNum}/reviews?per_page=100`)) ?? [];
+  const headReviewIds = new Set(
+    reviews
+      .filter((r): r is GhReview & { id: number } => isCodex(r.user?.login) && shortSha(r.commit_id ?? "") === head7 && r.id != null)
+      .map((r) => r.id)
+  );
+  if (headReviewIds.size === 0) {return null;}
+  const inline =
+    (await ghJson<GhInlineComment[]>(pi, `repos/${repo}/pulls/${prNum}/comments?per_page=100`)) ?? [];
+  return inline
+    .filter((c) => isCodex(c.user?.login) && c.pull_request_review_id != null && headReviewIds.has(c.pull_request_review_id))
+    .map(parseSuggestion)
+    .filter((s) => s.title);
+}
+
 /** Codex's verdict for `head`, or null if Codex hasn't reviewed this commit.
  *  Verdicts are keyed on the commit SHA, not wall-clock, so a stop/resume can't
  *  hide a verdict Codex already gave. Pass takes precedence over a later fail
@@ -121,39 +167,25 @@ export async function readCodexVerdict(
     (await ghJson<GhComment[]>(pi, `repos/${repo}/issues/${prNum}/comments?per_page=100`)) ?? [];
   const codexIssue = issueComments.filter((c) => isCodex(c.user?.login));
 
-  if (codexIssue.some((c) => PASS_RE.test(c.body) && shortSha(passCommit(c.body) ?? "") === head7)) {
+  if (passCommentForHead(codexIssue, head7)) {
     return { pass: true, timeout: false, stopped: false, quotaExhausted: false, unclassified: false, suggestions: [] };
   }
-  if (triggerAt && codexIssue.some((c) => QUOTA_RE.test(c.body) && c.created_at > triggerAt)) {
+  if (triggerAt && (await codexThumbsUp(pi, v))) {
+    return { pass: true, timeout: false, stopped: false, quotaExhausted: false, unclassified: false, suggestions: [] };
+  }
+  if (triggerAt && codexQuotaAfter(codexIssue, triggerAt)) {
     return { pass: false, timeout: false, stopped: false, quotaExhausted: true, unclassified: false, suggestions: [] };
   }
 
-  const reviews =
-    (await ghJson<GhReview[]>(pi, `repos/${repo}/pulls/${prNum}/reviews?per_page=100`)) ?? [];
-  const headReviewIds = new Set(
-    reviews
-      .filter((r): r is GhReview & { id: number } => isCodex(r.user?.login) && shortSha(r.commit_id ?? "") === head7 && r.id != null)
-      .map((r) => r.id)
-  );
-  if (headReviewIds.size > 0) {
-    const inline =
-      (await ghJson<GhInlineComment[]>(pi, `repos/${repo}/pulls/${prNum}/comments?per_page=100`)) ?? [];
-    const suggestions = inline
-      .filter(
-        (c) =>
-          isCodex(c.user?.login) &&
-          c.pull_request_review_id != null &&
-          headReviewIds.has(c.pull_request_review_id)
-      )
-      .map(parseSuggestion)
-      .filter((s) => s.title);
-    return { pass: false, timeout: false, stopped: false, quotaExhausted: false, unclassified: false, suggestions };
+  const suggestions = await readHeadSuggestions(pi, { repo, prNum, head7 });
+  if (suggestions !== null) {
+    return { pass: suggestions.length === 0, timeout: false, stopped: false, quotaExhausted: false, unclassified: false, suggestions };
   }
   // Codex posted after our trigger but matched nothing above → an unrecognized
   // reply (e.g. a bot "Something went wrong" that does NOT auto-retry). Don't
   // wait out the timeout: return unclassified so the caller stops + clears
   // triggerAt, and /loop resume re-posts @codex review.
-  if (triggerAt && codexIssue.some((c) => c.created_at > triggerAt)) {
+  if (triggerAt && codexReplyAfter(codexIssue, triggerAt)) {
     return { pass: false, timeout: false, stopped: false, quotaExhausted: false, unclassified: true, suggestions: [] };
   }
   return null;
