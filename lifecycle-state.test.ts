@@ -37,22 +37,22 @@ console.log("resolvePhase — result shape:");
 const r = resolvePhase({ wtExists: true, prState: "open", archived: false });
 check("review allowedTransitions === [archive]",
   r.allowedTransitions.length === 1 && r.allowedTransitions[0] === PHASE.ARCHIVE);
-check("review not terminal", r.isTerminal === false);
+check("review not terminal", !r.isTerminal);
 check("cleanup terminal",
-  resolvePhase({ wtExists: false, prState: "merged", archived: false }).isTerminal === true);
+  resolvePhase({ wtExists: false, prState: "merged", archived: false }).isTerminal);
 
 console.log("transition graph:");
 check("resolve→provision allowed",
-  isTransitionAllowed(PHASE.RESOLVE, PHASE.PROVISION) === true);
+  isTransitionAllowed(PHASE.RESOLVE, PHASE.PROVISION));
 check("resolve→cleanup allowed (merged shortcut)",
-  isTransitionAllowed(PHASE.RESOLVE, PHASE.CLEANUP) === true);
+  isTransitionAllowed(PHASE.RESOLVE, PHASE.CLEANUP));
 check("review→merge NOT allowed (must pass archive)",
-  isTransitionAllowed(PHASE.REVIEW, PHASE.MERGE) === false);
+  !isTransitionAllowed(PHASE.REVIEW, PHASE.MERGE));
 check("cleanup has no outgoing edges",
   OUTER_TRANSITIONS[PHASE.CLEANUP].length === 0);
 
 console.log("helpers:");
-check("isKnownPhase('review')", isKnownPhase("review") === true);
-check("isKnownPhase('nope')", isKnownPhase("nope") === false);
+check("isKnownPhase('review')", isKnownPhase("review"));
+check("isKnownPhase('nope')", !isKnownPhase("nope"));
 
 console.log(`\nALL ${passed} CHECKS PASSED`);
