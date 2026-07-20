@@ -47,11 +47,24 @@ type PrefixResult =
   | { kind: "abort" }
   | { kind: "dryRun" };
 
+/** If openspec/ exists locally but isn't tracked on main, commit + push it
+ *  so the worktree (created from origin/main) has it naturally. */
+async function ensureOpenspecTracked(pi: ExtensionAPI, ctx: LoopCtx, repoRoot: string): Promise<void> {
+  if (!existsSync(join(repoRoot, "openspec"))) {return;}
+  const { stdout: tracked } = await run(pi, ["git", "ls-files", "--", "openspec/"], repoRoot);
+  if (tracked.trim()) {return;}
+  await run(pi, ["git", "add", "openspec/"], repoRoot);
+  await run(pi, ["git", "commit", "-m", "chore: track openspec/"], repoRoot);
+  await run(pi, ["git", "push", "origin", "main"], repoRoot);
+  ctx.ui.notify("dev-loop: openspec/ was untracked — committed + pushed to main", "info");
+}
+
 /** Create/reuse the change's worktree and seed it (env files, openspec, TODO).
  *  Returns "abort" if worktree creation or change lookup fails. */
 async function provisionWorktree(p: PhaseCtx): Promise<"ok" | "abort"> {
   const { pi, ctx, change, wtDir } = p;
   const repoRoot = ctx.cwd;
+  await ensureOpenspecTracked(pi, ctx, repoRoot);
   if (!existsSync(wtDir)) {
     const { stderr: fetchErr, code: fetchCode } = await run(pi, ["git", "fetch", "origin", "main"], repoRoot);
     if (fetchCode !== 0) {
