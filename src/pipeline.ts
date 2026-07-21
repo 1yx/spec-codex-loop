@@ -47,39 +47,12 @@ type PrefixResult =
   | { kind: "abort" }
   | { kind: "dryRun" };
 
-/** If openspec/ exists locally but isn't tracked on main, commit + push it
- *  so the worktree (created from origin/main) has it naturally. If any step
- *  fails, roll local main back to its prior HEAD so it can't diverge from
- *  origin/main; provisionWorktree's cpSync then seeds openspec/ as fallback. */
-async function ensureOpenspecTracked(pi: ExtensionAPI, ctx: LoopCtx, repoRoot: string): Promise<void> {
-  if (!existsSync(join(repoRoot, "openspec"))) {return;}
-  const { stdout: tracked } = await run(pi, ["git", "ls-files", "--", "openspec/"], repoRoot);
-  if (tracked.trim()) {return;}
-  const { stdout: before } = await run(pi, ["git", "rev-parse", "HEAD"], repoRoot);
-  const rollback = async (step: string, stderr: string) => {
-    await run(pi, ["git", "reset", "--mixed", before.trim()], repoRoot);
-    ctx.ui.notify(`dev-loop: openspec/ track failed at ${step} (${stderr}); worktree copy will cover it`, "warning");
-  };
-  // Clear any staged openspec/ (defensive: a prior partial add or a concurrent
-  //  process could have staged changes/archive), then add only the scaffolding
-  //  (project.md, conventions). A change's proposal must never land on main
-  //  ahead of its own PR — provisionWorktree copies it into the worktree branch.
-  await run(pi, ["git", "reset", "-q", "--", "openspec/"], repoRoot);
-  const add = await run(pi, ["git", "add", "openspec/", ":!openspec/changes", ":!openspec/archive"], repoRoot);
-  if (add.code !== 0) {await rollback("add", add.stderr); return;}
-  const commit = await run(pi, ["git", "commit", "-m", "chore: track openspec/ scaffolding"], repoRoot);
-  if (commit.code !== 0) {await rollback("commit", commit.stderr); return;}
-  const push = await run(pi, ["git", "push", "origin", "main"], repoRoot);
-  if (push.code !== 0) {await rollback("push", push.stderr); return;}
-  ctx.ui.notify("dev-loop: openspec/ was untracked — committed + pushed to main", "info");
-}
-
-/** Create/reuse the change's worktree and seed it (env files, openspec, TODO).
- *  Returns "abort" if worktree creation or change lookup fails. */
+/** Create/reuse the change's worktree. openspec/ is plain tracked content
+ *  inherited from origin/main — no copy. The change's proposal must already
+ *  be committed + pushed to main, else abort. Returns "ok"/"abort". */
 async function provisionWorktree(p: PhaseCtx): Promise<"ok" | "abort"> {
   const { pi, ctx, change, wtDir } = p;
   const repoRoot = ctx.cwd;
-  await ensureOpenspecTracked(pi, ctx, repoRoot);
   if (!existsSync(wtDir)) {
     const { stderr: fetchErr, code: fetchCode } = await run(pi, ["git", "fetch", "origin", "main"], repoRoot);
     if (fetchCode !== 0) {
@@ -94,23 +67,14 @@ async function provisionWorktree(p: PhaseCtx): Promise<"ok" | "abort"> {
   } else {
     ctx.ui.notify(`dev-loop: resuming — reusing worktree ${wtDir}`, "info");
   }
+  const wtChangeDir = join(wtDir, "openspec", "changes", change);
+  if (!existsSync(wtChangeDir)) {
+    ctx.ui.notify(`dev-loop: openspec change "${change}" not on origin/main under openspec/changes/ — commit + push it to main first, then /loop resume`, "error");
+    await removeWorktree(pi, repoRoot, change);
+    return "abort";
+  }
   const envCopied = copyEnvFiles(repoRoot, wtDir);
   if (envCopied) {ctx.ui.notify(`dev-loop: copied ${envCopied} env file(s) (.env*) into worktree`, "info");}
-  const wtChangeDir = join(wtDir, "openspec", "changes", change);
-  if (!existsSync(join(wtDir, "openspec"))) {
-    cpSync(join(repoRoot, "openspec"), join(wtDir, "openspec"), { recursive: true });
-    ctx.ui.notify("dev-loop: no openspec/ in worktree — copied openspec/ from main repo", "info");
-  } else if (!existsSync(wtChangeDir)) {
-    const srcChangeDir = join(repoRoot, "openspec", "changes", change);
-    if (!existsSync(srcChangeDir)) {
-      ctx.ui.notify(`dev-loop: openspec change "${change}" not found under openspec/changes/; aborting`, "error");
-      await removeWorktree(pi, repoRoot, change);
-      return "abort";
-    }
-    cpSync(srcChangeDir, wtChangeDir, { recursive: true });
-    await run(pi, ["git", "add", `openspec/changes/${change}`], wtDir);
-    await run(pi, ["git", "commit", "-m", `spec: add ${change} change`], wtDir);
-  }
   const rootTodo = findTodoFile(repoRoot);
   if (rootTodo && !existsSync(join(wtDir, "TODO.md"))) {cpSync(rootTodo, join(wtDir, "TODO.md"));}
   return "ok";

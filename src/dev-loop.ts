@@ -41,6 +41,17 @@ async function initProject(pi: ExtensionAPI, ctx: LoopCtx): Promise<void> {
     if (code === 0) {ctx.ui.notify("dev-loop: ran `openspec init --tools pi`", "info");}
     else {ctx.ui.notify(`dev-loop: openspec init failed: ${stderr}`, "error");}
   }
+  // Track openspec/ on main so worktrees cut from origin/main inherit it (no
+  //  copy). Idempotent: only commits when openspec/ is untracked.
+  const { stdout: osTracked } = await run(pi, ["git", "ls-files", "--", "openspec/"], cwd);
+  if (existsSync(join(cwd, "openspec")) && !osTracked.trim()) {
+    await run(pi, ["git", "add", "openspec/"], cwd);
+    const c = await run(pi, ["git", "commit", "-m", "chore: track openspec/"], cwd);
+    if (c.code === 0) {
+      const p = await run(pi, ["git", "push", "origin", "main"], cwd);
+      ctx.ui.notify(p.code === 0 ? "dev-loop: committed + pushed openspec/ to main" : `dev-loop: openspec/ committed locally but push failed (${p.stderr})`, p.code === 0 ? "info" : "warning");
+    }
+  }
 }
 
 // --- /loop subcommand handlers ------------------------------------------------
