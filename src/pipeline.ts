@@ -347,7 +347,10 @@ async function handleTrigger(step: StepCtx): Promise<StepOutcome> {
     ctx.ui.notify(`dev-loop: trigger @codex review failed: ${stderr}`, "error");
     persist(); return "stop";
   }
-  s.triggerAt = await latestCommentAt(pi, s.repo, s.prNum);
+  // latestCommentAt can return "" right after the post (GitHub eventual
+  //  consistency on the issues/comments index, or an empty result). Fall back
+  //  to local time so !s.triggerAt can never re-fire @codex review each cycle.
+  s.triggerAt = (await latestCommentAt(pi, s.repo, s.prNum)) || new Date().toISOString();
   s.reviewDeadline = Temporal.Now.instant().epochMilliseconds + REVIEW_TOTAL_TIMEOUT_MS;
   s.inner = REVIEW_INNER.PROBE;
   ctx.ui.notify(`dev-loop: round ${s.round} on ${shortSha(s.head)} — triggered @codex review, polling every ${REVIEW_WAIT_MS / 60000}min (≤${REVIEW_TOTAL_TIMEOUT_MS / 60000}min; touch ${FETCH_SENTINEL} to recheck)…`, "info");
