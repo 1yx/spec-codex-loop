@@ -6,7 +6,7 @@ export const STOP_SENTINEL = ".dev-loop-stop";
 export const LOOP_STATE_FILE = ".loop-state.json";
 export const WORKTREE_ROOT = ".worktree";
 export const POLL_TICK_MS = 1000;
-export const REVIEW_WAIT_MS = 10 * 60_000; // poll interval between Codex fetches
+export const REVIEW_WAIT_MS = 2 * 60_000; // poll interval between Codex fetches
 export const REVIEW_TOTAL_TIMEOUT_MS = 30 * 60_000; // cap per round
 
 // --- cross-cutting types ------------------------------------------------------
