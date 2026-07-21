@@ -170,7 +170,7 @@ export async function readCodexVerdict(
   if (passCommentForHead(codexIssue, head7)) {
     return { pass: true, timeout: false, stopped: false, quotaExhausted: false, unclassified: false, suggestions: [] };
   }
-  if (triggerAt && (await codexThumbsUp(pi, v))) {
+  if (triggerAt && (await codexThumbsUp(pi, { repo, prNum, triggerAt }))) {
     return { pass: true, timeout: false, stopped: false, quotaExhausted: false, unclassified: false, suggestions: [] };
   }
   if (triggerAt && codexQuotaAfter(codexIssue, triggerAt)) {
