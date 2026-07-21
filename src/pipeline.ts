@@ -459,13 +459,13 @@ async function rederiveState(pi: ExtensionAPI, ctx: LoopCtx, change: string): Pr
 async function resolveInitialState(pi: ExtensionAPI, ctx: LoopCtx, change: string): Promise<InitState> {
   const s = readLoopState(ctx.cwd, change);
   if (s && s.phase !== PHASE.RESOLVE && s.phase !== PHASE.PROVISION) {
-    // On REVIEW resume, drop back to RECONCILE and re-probe GitHub: Codex's
-    //  verdict is per-head and may have changed since the stop. suggestions are
-    //  not persisted, so never resume into FIX trusting a stale list.
-    if (s.phase === PHASE.REVIEW) {
+    // driveChange calls this on EVERY wake (not just resume), so never clear
+    //  triggerAt/deadline here — that would re-fire @codex review every 2min.
+    //  Only fix the one unsafe resume target: FIX needs suggestions, which
+    //  aren't persisted, so resuming into FIX would no_progress on [] — drop it
+    //  back to RECONCILE to re-probe. triggerAt/deadline carry across wakes.
+    if (s.phase === PHASE.REVIEW && s.inner === REVIEW_INNER.FIX) {
       s.inner = REVIEW_INNER.RECONCILE;
-      s.triggerAt = null;
-      s.reviewDeadline = null;
       writeLoopState(ctx.cwd, change, s);
     }
     return { s };
