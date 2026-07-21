@@ -58,11 +58,8 @@ function notifyStatusEntry(ctx: LoopCtx, change: string, s: LoopState): void {
   );
 }
 
-/**
- * `/loop status`: scan every persisted loop state and report phase/inner/round/PR + stop reason.
- */
-function handleStatus(ctx: LoopCtx): void {
-  const cwd = ctx.cwd;
+/** Scan .worktree/ subdirs for persisted loop states (running or stopped). */
+function scanLoopStates(cwd: string): { change: string; s: LoopState }[] {
   const wtRoot = join(cwd, WORKTREE_ROOT);
   const found: { change: string; s: LoopState }[] = [];
   if (existsSync(wtRoot)) {
@@ -72,6 +69,14 @@ function handleStatus(ctx: LoopCtx): void {
       if (s) {found.push({ change: d.name, s });}
     }
   }
+  return found;
+}
+
+/**
+ * `/loop status`: scan every persisted loop state and report phase/inner/round/PR + stop reason.
+ */
+function handleStatus(ctx: LoopCtx): void {
+  const found = scanLoopStates(ctx.cwd);
   if (!found.length) {
     ctx.ui.notify("dev-loop: no loop state — nothing running, nothing stopped", "info");
     return;
@@ -83,12 +88,23 @@ function handleStatus(ctx: LoopCtx): void {
  * `/loop resume`: re-enter the change last stopped via `/loop stop`.
  */
 async function handleResume(pi: ExtensionAPI, ctx: LoopCtx): Promise<void> {
-  if (!rt.interruptedChange) {
-    ctx.ui.notify("dev-loop: nothing to resume (no change stopped via /loop stop)", "warning");
-    return;
+  let ch = rt.interruptedChange;
+  if (!ch) {
+    // interruptedChange is in-memory only and is lost on pi restart; fall back
+    //  to disk state — resume a change whose .loop-state.json shows it stopped.
+    const stopped = scanLoopStates(ctx.cwd).filter((x) => x.s.stopReason).map((x) => x.change);
+    if (stopped.length === 0) {
+      ctx.ui.notify("dev-loop: nothing to resume (no change stopped via /loop stop)", "warning");
+      return;
+    }
+    if (stopped.length > 1) {
+      ctx.ui.notify(`dev-loop: multiple stopped changes (${stopped.join(", ")}); specify one with /loop <change>`, "warning");
+      return;
+    }
+    ch = stopped[0];
+    ctx.ui.notify(`dev-loop: interruptedChange lost on restart — resuming "${ch}" from disk state`, "info");
   }
   if (!(await checkPreconditions(pi, ctx))) {return;}
-  const ch = rt.interruptedChange;
   ctx.ui.notify(`dev-loop: resuming "${ch}"`, "info");
   rt.runCtx = { ctx, change: ch, dryRun: false, all: false, oneOff: true };
   rt.loopActive = true;
