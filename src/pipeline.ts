@@ -48,14 +48,29 @@ type PrefixResult =
   | { kind: "dryRun" };
 
 /** If openspec/ exists locally but isn't tracked on main, commit + push it
- *  so the worktree (created from origin/main) has it naturally. */
+ *  so the worktree (created from origin/main) has it naturally. If any step
+ *  fails, roll local main back to its prior HEAD so it can't diverge from
+ *  origin/main; provisionWorktree's cpSync then seeds openspec/ as fallback. */
 async function ensureOpenspecTracked(pi: ExtensionAPI, ctx: LoopCtx, repoRoot: string): Promise<void> {
   if (!existsSync(join(repoRoot, "openspec"))) {return;}
   const { stdout: tracked } = await run(pi, ["git", "ls-files", "--", "openspec/"], repoRoot);
   if (tracked.trim()) {return;}
-  await run(pi, ["git", "add", "openspec/"], repoRoot);
-  await run(pi, ["git", "commit", "-m", "chore: track openspec/"], repoRoot);
-  await run(pi, ["git", "push", "origin", "main"], repoRoot);
+  const { stdout: before } = await run(pi, ["git", "rev-parse", "HEAD"], repoRoot);
+  const rollback = async (step: string, stderr: string) => {
+    await run(pi, ["git", "reset", "--mixed", before.trim()], repoRoot);
+    ctx.ui.notify(`dev-loop: openspec/ track failed at ${step} (${stderr}); worktree copy will cover it`, "warning");
+  };
+  // Clear any staged openspec/ (defensive: a prior partial add or a concurrent
+  //  process could have staged changes/archive), then add only the scaffolding
+  //  (project.md, conventions). A change's proposal must never land on main
+  //  ahead of its own PR — provisionWorktree copies it into the worktree branch.
+  await run(pi, ["git", "reset", "-q", "--", "openspec/"], repoRoot);
+  const add = await run(pi, ["git", "add", "openspec/", ":!openspec/changes", ":!openspec/archive"], repoRoot);
+  if (add.code !== 0) {await rollback("add", add.stderr); return;}
+  const commit = await run(pi, ["git", "commit", "-m", "chore: track openspec/ scaffolding"], repoRoot);
+  if (commit.code !== 0) {await rollback("commit", commit.stderr); return;}
+  const push = await run(pi, ["git", "push", "origin", "main"], repoRoot);
+  if (push.code !== 0) {await rollback("push", push.stderr); return;}
   ctx.ui.notify("dev-loop: openspec/ was untracked — committed + pushed to main", "info");
 }
 
@@ -274,6 +289,17 @@ async function handleResolveMain(step: StepCtx): Promise<StepOutcome> {
  */
 async function handleProbe(step: StepCtx): Promise<StepOutcome> {
   const { pi, ctx, change, s, persist } = step;
+  // Gate: if local head isn't the PR's remote head, Codex can never produce a
+  //  verdict for s.head (GitHub has no such commit) and we'd loop forever
+  //  re-triggering @codex review. Stop so the user pushes, then /loop resume.
+  //  gh itself failing (network/auth) is skipped so it can't false-trip this.
+  const { stdout: remoteHead, code: rhCode } = await run(pi, ["gh", "pr", "view", String(s.prNum), "--repo", s.repo, "--json", "headRefOid", "-q", ".headRefOid"]);
+  if (rhCode === 0 && shortSha(remoteHead) !== shortSha(s.head)) {
+    s.stopReason = "head_not_pushed"; rt.interruptedChange = change;
+    s.triggerAt = null; s.reviewDeadline = null;
+    ctx.ui.notify(`dev-loop: local head ${shortSha(s.head)} ≠ PR head ${shortSha(remoteHead)} — push, then /loop resume`, "error");
+    persist(); return "stop";
+  }
   const v = await readCodexVerdict(pi, { repo: s.repo, prNum: s.prNum, head: s.head, triggerAt: s.triggerAt });
   if (!v) {
     if (!s.triggerAt) { s.inner = REVIEW_INNER.TRIGGER; persist(); return "cont"; }
@@ -465,7 +491,18 @@ async function rederiveState(pi: ExtensionAPI, ctx: LoopCtx, change: string): Pr
 /** Read persisted state; if absent or at RESOLVE/PROVISION, re-derive via runPrefix. */
 async function resolveInitialState(pi: ExtensionAPI, ctx: LoopCtx, change: string): Promise<InitState> {
   const s = readLoopState(ctx.cwd, change);
-  if (s && s.phase !== PHASE.RESOLVE && s.phase !== PHASE.PROVISION) {return { s };}
+  if (s && s.phase !== PHASE.RESOLVE && s.phase !== PHASE.PROVISION) {
+    // On REVIEW resume, drop back to RECONCILE and re-probe GitHub: Codex's
+    //  verdict is per-head and may have changed since the stop. suggestions are
+    //  not persisted, so never resume into FIX trusting a stale list.
+    if (s.phase === PHASE.REVIEW) {
+      s.inner = REVIEW_INNER.RECONCILE;
+      s.triggerAt = null;
+      s.reviewDeadline = null;
+      writeLoopState(ctx.cwd, change, s);
+    }
+    return { s };
+  }
   return rederiveState(pi, ctx, change);
 }
 

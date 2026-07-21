@@ -49,7 +49,9 @@ export function readLoopState(repoRoot: string, change: string): LoopState | nul
   try {
     const p = statePath(repoRoot, change);
     if (!existsSync(p)) {return null;}
-    return JSON.parse(readFileSync(p, "utf-8")) as LoopState;
+    const parsed = JSON.parse(readFileSync(p, "utf-8")) as LoopState;
+    // suggestions are never persisted (writeLoopState omits them) — default to [].
+    return { ...parsed, suggestions: parsed.suggestions ?? [] };
   } catch { return null; }
 }
 /**
@@ -58,7 +60,9 @@ export function readLoopState(repoRoot: string, change: string): LoopState | nul
 export function writeLoopState(repoRoot: string, change: string, s: LoopState): void {
   const p = statePath(repoRoot, change);
   const tmp = `${p}.tmp`;
-  try { writeFileSync(tmp, JSON.stringify(s)); renameSync(tmp, p); } catch { /* resume re-derives */ }
+  // suggestions are an ephemeral per-head Codex verdict — omit on persist so a
+  //  resume always re-probes GitHub instead of trusting a stale list.
+  try { writeFileSync(tmp, JSON.stringify(s, (k, v) => k === "suggestions" ? undefined : v)); renameSync(tmp, p); } catch { /* resume re-derives */ }
 }
 /**
  * Delete a change's persisted loop state (after a clean merge).
