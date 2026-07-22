@@ -1,4 +1,5 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { randomUUID } from "node:crypto";
 import { cpSync, existsSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import { BUILD_INNER, PHASE, REVIEW_INNER } from "./lifecycle-state.ts";
@@ -24,7 +25,6 @@ import {
   ensureLocalIgnore,
   findTodoFile,
   markChangeDone,
-  pickTask,
   prStateFor,
   reconcileBranch,
   removeWorktree,
@@ -33,7 +33,7 @@ import {
 } from "./git-utils.ts";
 import { latestCommentAt, readCodexVerdict, reviewTriggerAt, shortSha, suggestionKey } from "./codex.ts";
 import { buildImplement, fixPhase, resolveMainPhase } from "./phases.ts";
-import { clearLoopState, readLoopState, releaseLoopLock, scheduleWait, stopSentinelTicker, waitAction, writeLoopState } from "./control.ts";
+import { readLoopState, scheduleWait, waitAction, writeLoopState } from "./control.ts";
 
 /**
  * Outcome of a oneStep transition: continue / suspend (review_wait) / done / stop.
@@ -49,6 +49,13 @@ type PrefixResult =
   | { kind: "merged" }
   | { kind: "abort" }
   | { kind: "dryRun" };
+
+/** Forget one completed/abandoned review trigger attempt. */
+function resetReviewAttempt(s: LoopState): void {
+  s.triggerAt = null;
+  s.triggerNonce = null;
+  s.reviewDeadline = null;
+}
 
 /** Create/reuse the change's worktree. openspec/ is plain tracked content
  *  inherited from origin/main — no copy. The change's proposal must already
@@ -94,7 +101,7 @@ async function clearRunArtifacts(pi: ExtensionAPI, repoRoot: string): Promise<vo
   await ensureLocalIgnore(pi, repoRoot, `${WORKTREE_ROOT}/`);
   await ensureLocalIgnore(pi, repoRoot, FETCH_SENTINEL);
   await ensureLocalIgnore(pi, repoRoot, STOP_SENTINEL);
-  await ensureLocalIgnore(pi, repoRoot, LOOP_LOCK_FILE);
+  await ensureLocalIgnore(pi, repoRoot, `${LOOP_LOCK_FILE}*`);
   await ensureLocalIgnore(pi, repoRoot, LOOP_STATE_FILE);
 }
 
@@ -196,7 +203,7 @@ async function handleReconcile(step: StepCtx): Promise<StepOutcome> {
       break;
     case "timeout":
       s.stopReason = "timeout"; rt.interruptedChange = change;
-      s.triggerAt = null; s.reviewDeadline = null;
+      resetReviewAttempt(s);
       ctx.ui.notify(`dev-loop: no Codex review after ${REVIEW_TOTAL_TIMEOUT_MS / 60000}min on round ${s.round}; stopping (PR + worktree left)`, "info");
       persist(); return "stop";
     default:
@@ -223,7 +230,7 @@ async function handleReconcile(step: StepCtx): Promise<StepOutcome> {
       ctx.ui.notify(`dev-loop: push of main merge failed (${stderr}); stopping — fix then /loop resume`, "error");
       persist(); return "stop";
     }
-    s.head = r.head; s.triggerAt = null; s.reviewDeadline = null;
+    s.head = r.head; resetReviewAttempt(s);
     ctx.ui.notify(`dev-loop: merged origin/main (clean) on round ${s.round}; re-triggering @codex review on the merged head`, "info");
     s.inner = REVIEW_INNER.PROBE; persist(); return "cont";
   }
@@ -250,7 +257,7 @@ async function handleResolveMain(step: StepCtx): Promise<StepOutcome> {
     persist(); return "stop";
   }
   const { stdout: head } = await run(pi, ["git", "rev-parse", "HEAD"], wtDir);
-  s.head = head; s.triggerAt = null; s.reviewDeadline = null;
+  s.head = head; resetReviewAttempt(s);
   s.inner = REVIEW_INNER.RECONCILE; persist(); return "cont";
 }
 
@@ -266,7 +273,7 @@ async function handleProbe(step: StepCtx): Promise<StepOutcome> {
   const { stdout: remoteHead, code: rhCode } = await run(pi, ["gh", "pr", "view", String(s.prNum), "--repo", s.repo, "--json", "headRefOid", "-q", ".headRefOid"]);
   if (rhCode === 0 && shortSha(remoteHead) !== shortSha(s.head)) {
     s.stopReason = "head_not_pushed"; rt.interruptedChange = change;
-    s.triggerAt = null; s.reviewDeadline = null;
+    resetReviewAttempt(s);
     ctx.ui.notify(`dev-loop: local head ${shortSha(s.head)} ≠ PR head ${shortSha(remoteHead)} — push, then /loop resume`, "error");
     persist(); return "stop";
   }
@@ -281,13 +288,13 @@ async function handleProbe(step: StepCtx): Promise<StepOutcome> {
   }
   if (v.unclassified) {
     s.stopReason = "codex_error"; rt.interruptedChange = change;
-    s.triggerAt = null; s.reviewDeadline = null;
+    resetReviewAttempt(s);
     ctx.ui.notify(`dev-loop: Codex replied with an unrecognized comment on round ${s.round} (likely an error); stopping — /loop resume re-triggers @codex review`, "warning");
     persist(); return "stop";
   }
   if (v.quotaExhausted) {
     s.stopReason = "quota"; rt.interruptedChange = change;
-    s.triggerAt = null; s.reviewDeadline = null;
+    resetReviewAttempt(s);
     ctx.ui.notify(`dev-loop: Codex review quota exhausted — stopping (PR + worktree left); /loop resume after it resets re-triggers @codex review`, "info");
     persist(); return "stop";
   }
@@ -297,7 +304,7 @@ async function handleProbe(step: StepCtx): Promise<StepOutcome> {
   }
   const sig = suggestionKey(v.suggestions);
   if (s.seenSignatures.includes(sig)) {
-    s.stopReason = "repeat"; rt.interruptedChange = change; s.triggerAt = null; s.reviewDeadline = null;
+    s.stopReason = "repeat"; rt.interruptedChange = change; resetReviewAttempt(s);
     ctx.ui.notify(`dev-loop: round ${s.round} repeats a prior review (fixes not landing); stopping (PR + worktree left)`, "warning");
     persist(); return "stop";
   }
@@ -311,9 +318,10 @@ async function handleProbe(step: StepCtx): Promise<StepOutcome> {
  */
 async function handleTrigger(step: StepCtx): Promise<StepOutcome> {
   const { pi, ctx, s, persist } = step;
-  let triggerAt = await reviewTriggerAt(pi, { repo: s.repo, prNum: s.prNum, head: s.head });
+  if (!s.triggerNonce) {s.triggerNonce = randomUUID(); persist();}
+  let triggerAt = await reviewTriggerAt(pi, { repo: s.repo, prNum: s.prNum, head: s.head, nonce: s.triggerNonce });
   if (!triggerAt) {
-    const body = `@codex review\n<!-- spec-codex-loop:${s.head} -->`;
+    const body = `@codex review\n<!-- spec-codex-loop:${s.head}:${s.triggerNonce} -->`;
     const { code, stderr } = await run(pi, ["gh", "pr", "comment", String(s.prNum), "--body", body, "--repo", s.repo]);
     if (code !== 0) {
       s.stopReason = "trigger_failed";
@@ -363,8 +371,7 @@ async function handleFix(step: StepCtx): Promise<StepOutcome> {
   }
   s.agentHead = null;
   s.round++;
-  s.triggerAt = null;
-  s.reviewDeadline = null;
+  resetReviewAttempt(s);
   s.inner = REVIEW_INNER.RECONCILE; persist(); return "cont";
 }
 
@@ -410,7 +417,7 @@ async function reconcileMainBeforeArchive(step: StepCtx): Promise<StepOutcome | 
       persist(); return "stop";
     }
     s.phase = PHASE.REVIEW; s.inner = REVIEW_INNER.PROBE; s.head = headAfterMerge;
-    s.triggerAt = null; s.reviewDeadline = null; s.suggestions = [];
+    resetReviewAttempt(s); s.suggestions = [];
     ctx.ui.notify(`dev-loop: origin/main changed the approved head to ${shortSha(s.head)}; returning to Codex review before archive`, "info");
     persist(); return "cont";
   }
@@ -546,60 +553,5 @@ export async function driveChange(pi: ExtensionAPI, ctx: LoopCtx, change: string
     if (out === "done") {return "completed";}
     if (out === "stop") {return "stopped";}
     await yieldTick();
-  }
-}
-
-/** Re-entrant entry (the handler, the review_wait timer, and /loop fetch all
- *  call it). Walks steps until the current change suspends or finishes; for
- *  --all, chains the next TODO change. Owns loopActive + ticker lifecycle. */
-function handleCompleted(ctx: LoopCtx): "chain" | "done" {
-  const change = rt.runCtx?.change ?? "";
-  clearLoopState(ctx.cwd, change);
-  ctx.ui.notify(`dev-loop: "${change}" merged ✅`, "info");
-  if (rt.runCtx?.all && !rt.runCtx.oneOff) {
-    const next = pickTask(ctx.cwd);
-    if (next) { rt.runCtx = { ...rt.runCtx, change: next.text }; return "chain"; }
-  }
-  rt.loopActive = false; stopSentinelTicker(); rt.runCtx = null; releaseLoopLock();
-  return "done";
-}
-
-/**
- * Tear down a loop chain: record interruptedChange if stopped, clear loopActive/ticker/runCtx.
- */
-function endChain(change: string, stopped: boolean): void {
-  if (stopped) {rt.interruptedChange = change;}
-  rt.loopActive = false; stopSentinelTicker(); rt.runCtx = null; releaseLoopLock();
-}
-
-/**
- * Re-entrant driver entry: walk steps until the change suspends/completes; chains --all.
- */
-export async function runLoopChain(): Promise<void> {
-  if (!rt.piRef || !rt.runCtx || rt.stepping) {return;}
-  const pi = rt.piRef;
-  const ctx = rt.runCtx.ctx;
-  rt.stepping = true;
-  try {
-    while (rt.runCtx) {
-      if (rt.stopRequested) {
-        const ch = rt.runCtx.change;
-        const s = readLoopState(ctx.cwd, ch);
-        if (s) { s.stopReason = "stopped"; writeLoopState(ctx.cwd, ch, s); }
-        ctx.ui.notify(`dev-loop: stopped (PR + worktree left); use /loop resume`, "info");
-        endChain(ch, true);
-        return;
-      }
-      const outcome = await driveChange(pi, ctx, rt.runCtx.change);
-      if (outcome === "suspended") {return;}
-      if (outcome === "completed") {
-        if (handleCompleted(ctx) === "chain") {continue;}
-        return;
-      }
-      endChain(rt.runCtx.change, outcome === "stopped");
-      return;
-    }
-  } finally {
-    rt.stepping = false;
   }
 }

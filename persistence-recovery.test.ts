@@ -3,6 +3,7 @@ import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import {
   acquireLoopLock,
   readLoopState,
@@ -106,8 +107,10 @@ withRoot((root) => {
 withRoot((root) => {
   const ctx: LoopCtx = { cwd: root, ui: { notify: () => undefined } };
   writeFileSync(join(root, LOOP_LOCK_FILE), "not-json");
+  writeFileSync(join(root, `${LOOP_LOCK_FILE}.reclaim`), JSON.stringify({ pid: 2_147_483_647 }));
   rt.loopLockPath = null;
   check("malformed stale lock is reclaimed", acquireLoopLock(ctx));
+  check("stale legacy recovery guard is removed", !existsSync(join(root, `${LOOP_LOCK_FILE}.reclaim`)));
   releaseLoopLock();
   writeFileSync(join(root, LOOP_LOCK_FILE), JSON.stringify({ pid: 2_147_483_647 }));
   check("dead-process lock is reclaimed", acquireLoopLock(ctx));
@@ -131,5 +134,88 @@ withRoot((root) => {
     rt.loopLockPath = null;
   }
 }
+
+console.log("concurrent stale-lock recovery:");
+{
+  const root = mkdtempSync(join(tmpdir(), "spec-loop-lock-race-"));
+  const readyDir = join(root, "ready");
+  const goPath = join(root, "go");
+  mkdirSync(readyDir);
+  writeFileSync(join(root, LOOP_LOCK_FILE), "stale-malformed-lock");
+  writeFileSync(join(root, `${LOOP_LOCK_FILE}.reclaim`), "stale-recovery-guard");
+  const controlUrl = pathToFileURL(join(process.cwd(), "src", "control.ts")).href;
+  const worker = `
+    import { existsSync, writeFileSync } from "node:fs";
+    import { join } from "node:path";
+    import { acquireLoopLock, releaseLoopLock } from ${JSON.stringify(controlUrl)};
+    const [root, id] = process.argv.slice(1);
+    writeFileSync(join(root, "ready", id), "");
+    while (!existsSync(join(root, "go"))) await new Promise((resolve) => setTimeout(resolve, 2));
+    const acquired = acquireLoopLock({ cwd: root, ui: { notify() {} } });
+    process.stdout.write(acquired ? "acquired" : "rejected");
+    if (acquired) {
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      releaseLoopLock();
+    }
+  `;
+  const children = Array.from({ length: 8 }, (_, index) => {
+    const child = spawn(process.execPath, ["--input-type=module", "--eval", worker, root, String(index)], { stdio: ["ignore", "pipe", "ignore"] });
+    return new Promise<string>((resolve, reject) => {
+      let stdout = "";
+      child.stdout.on("data", (chunk: Buffer) => {stdout += chunk.toString();});
+      child.on("error", reject);
+      child.on("exit", (code) => code === 0 ? resolve(stdout) : reject(new Error(`lock worker exited ${code}`)));
+    });
+  });
+  try {
+    for (let tries = 0; tries < 500 && !Array.from({ length: 8 }, (_, index) => existsSync(join(readyDir, String(index)))).every(Boolean); tries++) {
+      await new Promise((resolve) => setTimeout(resolve, 2));
+    }
+    writeFileSync(goPath, "");
+    const results = await Promise.all(children);
+    check("exactly one process acquires a concurrently reclaimed stale lock", results.filter((result) => result === "acquired").length === 1);
+  } finally {rmSync(root, { recursive: true, force: true });}
+}
+
+console.log("process-crash lock recovery:");
+{
+  const root = mkdtempSync(join(tmpdir(), "spec-loop-lock-crash-"));
+  const controlUrl = pathToFileURL(join(process.cwd(), "src", "control.ts")).href;
+  const worker = `
+    import { acquireLoopLock } from ${JSON.stringify(controlUrl)};
+    const root = process.argv[1];
+    if (!acquireLoopLock({ cwd: root, ui: { notify() {} } })) process.exit(2);
+    process.stdout.write("acquired");
+    setInterval(() => {}, 1000);
+  `;
+  const child = spawn(process.execPath, ["--input-type=module", "--eval", worker, root], { stdio: ["ignore", "pipe", "ignore"] });
+  try {
+    await new Promise<void>((resolve, reject) => {
+      child.stdout.once("data", () => resolve());
+      child.once("error", reject);
+      child.once("exit", (code) => reject(new Error(`lock holder exited early ${code}`)));
+    });
+    child.kill("SIGKILL");
+    await new Promise<void>((resolve) => child.once("exit", () => resolve()));
+    const ctx: LoopCtx = { cwd: root, ui: { notify: () => undefined } };
+    rt.loopLockPath = null; rt.loopLockToken = null; rt.loopLockDb = null;
+    check("OS transaction is recoverable after lock-holder process death", acquireLoopLock(ctx));
+    releaseLoopLock();
+  } finally {
+    if (!child.killed) {child.kill("SIGKILL");}
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+withRoot((root) => {
+  const lockPath = join(root, LOOP_LOCK_FILE);
+  const ctx: LoopCtx = { cwd: root, ui: { notify: () => undefined } };
+  rt.loopLockPath = null;
+  rt.loopLockToken = null;
+  check("owner acquires lock before replacement check", acquireLoopLock(ctx));
+  writeFileSync(lockPath, JSON.stringify({ pid: process.pid, token: "replacement-owner" }));
+  releaseLoopLock();
+  check("release does not delete a replacement owner's lock", existsSync(lockPath));
+});
 
 console.log(`\nALL ${passed} PERSISTENCE RECOVERY CHECKS PASSED`);

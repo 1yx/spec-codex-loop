@@ -6,7 +6,7 @@ import { ensureLocalIgnore, findTodoFile, pickTask, removeFromLocalIgnore, run }
 import { acquireLoopLock, clearWaitTimer, readLoopState, startSentinelTicker, writeControl } from "./control.ts";
 import { shortSha } from "./codex.ts";
 import { checkPreconditions } from "./phases.ts";
-import { runLoopChain } from "./pipeline.ts";
+import { runLoopChain } from "./loop-driver.ts";
 
 // --- project init (/loop init) ------------------------------------------------
 /** Commit newly-created loop artifacts so future worktrees inherit them. */
@@ -50,7 +50,7 @@ async function initProject(pi: ExtensionAPI, ctx: LoopCtx): Promise<void> {
   }
   await removeFromLocalIgnore(pi, cwd, "TODO.md");
   await ensureLocalIgnore(pi, cwd, `${WORKTREE_ROOT}/`);
-  await ensureLocalIgnore(pi, cwd, LOOP_LOCK_FILE);
+  await ensureLocalIgnore(pi, cwd, `${LOOP_LOCK_FILE}*`);
   if (existsSync(join(cwd, "openspec"))) {
     ctx.ui.notify("dev-loop: openspec/ already present", "info");
   } else {
@@ -141,6 +141,7 @@ async function handleResume(pi: ExtensionAPI, ctx: LoopCtx): Promise<void> {
     ctx.ui.notify(`dev-loop: interruptedChange lost on restart — resuming "${ch}" from disk state`, "info");
   }
   if (!(await checkPreconditions(pi, ctx))) {return;}
+  await ensureLocalIgnore(pi, ctx.cwd, `${LOOP_LOCK_FILE}*`);
   ctx.ui.notify(`dev-loop: resuming "${ch}"`, "info");
   const runCtx = { ctx, change: ch, dryRun: false, all: false, oneOff: true };
   if (!beginRun(ctx, runCtx)) {return;}
@@ -159,6 +160,7 @@ async function handleNormalRun(pi: ExtensionAPI, ctx: LoopCtx, tokens: string[])
   const oneOff = positional.join(" ").trim();
   const cwd = ctx.cwd;
   if (!(await checkPreconditions(pi, ctx))) {return;}
+  await ensureLocalIgnore(pi, cwd, `${LOOP_LOCK_FILE}*`);
   let firstChange: string | null = null;
   if (oneOff) {
     if (!existsSync(join(cwd, "openspec", "changes", oneOff))) {

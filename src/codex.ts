@@ -118,9 +118,10 @@ export async function latestCommentAt(pi: ExtensionAPI, repo: string, prNum: num
   return comments[comments.length - 1]?.created_at ?? "";
 }
 
-/** Timestamp of a trigger previously posted for this exact head. */
-export async function reviewTriggerAt(pi: ExtensionAPI, ids: { repo: string; prNum: number; head: string }): Promise<string> {
-  const marker = `<!-- spec-codex-loop:${ids.head} -->`;
+/** Timestamp of this exact trigger attempt. The nonce prevents a historical
+ * attempt for the same head from suppressing an intentional re-trigger. */
+export async function reviewTriggerAt(pi: ExtensionAPI, ids: { repo: string; prNum: number; head: string; nonce: string }): Promise<string> {
+  const marker = `<!-- spec-codex-loop:${ids.head}:${ids.nonce} -->`;
   const comments = await ghJsonAll<GhComment>(pi, `repos/${ids.repo}/issues/${ids.prNum}/comments`);
   return comments.findLast((comment) => comment.body.includes(marker))?.created_at ?? "";
 }

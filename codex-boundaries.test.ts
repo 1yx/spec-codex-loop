@@ -101,9 +101,11 @@ async function staleQuotaAndFreshErrorClassifyCorrectly(): Promise<void> {
 
 async function triggerMarkerSurvivesEventualConsistency(): Promise<void> {
   const api = new GithubApi();
-  const marker = `@codex review\n<!-- spec-codex-loop:${HEAD} -->`;
+  const nonce = "attempt-1";
+  const marker = `@codex review\n<!-- spec-codex-loop:${HEAD}:${nonce} -->`;
   api.page(issueUrl(), [{ id: 1, user: { login: "test-user" }, created_at: "2026-07-22T00:01:00Z", body: marker }]);
-  assert.equal(await reviewTriggerAt(api.pi, { repo: REPO, prNum: PR_NUM, head: HEAD }), "2026-07-22T00:01:00Z");
+  assert.equal(await reviewTriggerAt(api.pi, { repo: REPO, prNum: PR_NUM, head: HEAD, nonce }), "2026-07-22T00:01:00Z");
+  assert.equal(await reviewTriggerAt(api.pi, { repo: REPO, prNum: PR_NUM, head: HEAD, nonce: "attempt-2" }), "");
   assert.equal(await latestCommentAt(api.pi, REPO, PR_NUM), "2026-07-22T00:01:00Z");
 }
 

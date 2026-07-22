@@ -50,6 +50,9 @@ export type LoopState = {
   head: string;
   repo: string;
   triggerAt: string | null;
+  /** Stable ID for one review-trigger side effect. Persisted before posting so
+   * a crash can deduplicate that attempt without suppressing later attempts. */
+  triggerNonce?: string | null;
   reviewDeadline: number | null;
   seenSignatures: string[];
   suggestions: Suggestion[];
@@ -129,6 +132,8 @@ type RtState = {
   turnResolve: ((result: AgentTurnResult) => void) | null;
   turnResult: AgentTurnResult | null;
   loopLockPath: string | null;
+  loopLockToken: string | null;
+  loopLockDb: { exec(sql: string): void; close(): void } | null;
   /** Loop wake callback (set by the entry; control/timer trigger it without
    *  importing the pipeline, avoiding a control↔pipeline import cycle). */
   wakeLoop: (() => void | Promise<void>) | null;
@@ -147,6 +152,8 @@ export const rt: RtState = {
   turnResolve: null,
   turnResult: null,
   loopLockPath: null,
+  loopLockToken: null,
+  loopLockDb: null,
   wakeLoop: null,
 };
 

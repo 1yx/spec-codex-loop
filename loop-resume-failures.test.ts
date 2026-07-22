@@ -272,9 +272,12 @@ async function legacyFixStateReprobes(): Promise<void> {
 async function codexBotStopRetriggers(mode: "error" | "quota", reason: string): Promise<void> {
   const h = new ResumeHarness({ reviewMode: mode });
   try {
+    const priorNonce = "prior-attempt";
+    h.postedComments.push(`@codex review\n<!-- spec-codex-loop:${h.head}:${priorNonce} -->`);
     const state = h.state({
       phase: PHASE.REVIEW, inner: REVIEW_INNER.PROBE,
       triggerAt: "2026-07-22T00:00:00Z", reviewDeadline: Temporal.Now.instant().epochMilliseconds + 60_000,
+      triggerNonce: priorNonce,
       stopReason: null,
     });
     const outcome = await oneStep({
@@ -284,6 +287,7 @@ async function codexBotStopRetriggers(mode: "error" | "quota", reason: string): 
     assert.equal(outcome, "stop");
     assert.equal(state.stopReason, reason);
     assert.equal(state.triggerAt, null);
+    assert.equal(state.triggerNonce, null);
     assert.equal(state.reviewDeadline, null);
 
     h.reviewMode = "pending";
@@ -291,6 +295,8 @@ async function codexBotStopRetriggers(mode: "error" | "quota", reason: string): 
     await h.resume();
     assert.equal(rt.loopActive, true);
     assert.ok(h.commands.some((call) => call[0] === "gh" && call[1] === "pr" && call[2] === "comment"));
+    assert.equal(h.postedComments.length, 2, `${mode} resume must create a fresh attempt on the same head`);
+    assert.notEqual(h.postedComments[0], h.postedComments[1]);
 
     h.reviewMode = "pass";
     await h.run("fetch");
@@ -299,6 +305,36 @@ async function codexBotStopRetriggers(mode: "error" | "quota", reason: string): 
   } finally {
     h.dispose();
   }
+}
+
+async function timeoutStopRetriggersSameHead(): Promise<void> {
+  const h = new ResumeHarness({ reviewMode: "pending" });
+  try {
+    const priorNonce = "timed-out-attempt";
+    h.postedComments.push(`@codex review\n<!-- spec-codex-loop:${h.head}:${priorNonce} -->`);
+    const state = h.state({
+      phase: PHASE.REVIEW, inner: REVIEW_INNER.RECONCILE,
+      triggerAt: "2026-07-22T00:00:00Z", triggerNonce: priorNonce,
+      reviewDeadline: 1, stopReason: null,
+    });
+    const outcome = await oneStep({
+      pi: h.pi, ctx: h.ctx, change: h.change, s: state,
+      wtDir: join(h.root, ".worktree", h.change), persist: () => h.persist(state),
+    });
+    assert.equal(outcome, "stop");
+    assert.equal(state.stopReason, "timeout");
+    assert.equal(state.triggerNonce, null);
+
+    rt.interruptedChange = null;
+    await h.resume();
+    assert.equal(h.postedComments.length, 2, "timeout resume must post a fresh attempt on the same head");
+    assert.notEqual(h.postedComments[0], h.postedComments[1]);
+
+    h.reviewMode = "pass";
+    await h.run("fetch");
+    for (let i = 0; i < 20 && h.stateExists(); i++) {await new Promise((resolve) => setTimeout(resolve, 5));}
+    assert.equal(h.stateExists(), false);
+  } finally {h.dispose();}
 }
 
 async function multipleStoppedChangesAreNotGuessed(): Promise<void> {
@@ -372,7 +408,8 @@ await stoppedProbeReconcilesManualHead();
 await legacyFixStateReprobes();
 await codexBotStopRetriggers("quota", "quota");
 await codexBotStopRetriggers("error", "codex_error");
+await timeoutStopRetriggersSameHead();
 await multipleStoppedChangesAreNotGuessed();
 await stopThenResumeFromDisk();
 await staleControlsAreCleared();
-console.log("ALL 22 RESUME FAILURE/RECOVERY SCENARIOS PASSED");
+console.log("ALL 23 RESUME FAILURE/RECOVERY SCENARIOS PASSED");

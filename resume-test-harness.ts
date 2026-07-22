@@ -132,7 +132,9 @@ export class ResumeHarness {
     if (rt.sentinelTicker) {clearInterval(rt.sentinelTicker);}
     rt.piRef = null; rt.runCtx = null; rt.loopActive = false; rt.stepping = false;
     rt.interruptedChange = null; rt.stopRequested = false; rt.fetchRequested = false;
-    rt.sentinelTicker = null; rt.turnResolve = null; rt.turnResult = null; rt.loopLockPath = null; rt.wakeLoop = null;
+    rt.sentinelTicker = null; rt.turnResolve = null; rt.turnResult = null;
+    if (rt.loopLockDb) {try {rt.loopLockDb.close();} catch { /* already closed */ }}
+    rt.loopLockPath = null; rt.loopLockToken = null; rt.loopLockDb = null; rt.wakeLoop = null;
   }
 
   // eslint-disable-next-line complexity

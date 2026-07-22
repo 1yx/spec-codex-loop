@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
-import { mkdirSync } from "node:fs";
+import { existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { BUILD_INNER, PHASE, REVIEW_INNER } from "./src/lifecycle-state.ts";
-import type { LoopState } from "./src/runtime.ts";
+import { LOOP_LOCK_FILE, rt, type LoopState } from "./src/runtime.ts";
 import { ResumeHarness, type HarnessOptions } from "./resume-test-harness.ts";
 
 type CrashCase = {
@@ -85,4 +85,18 @@ for (const testCase of cases) {
   }
 }
 
-console.log(`ALL ${cases.length * 2} CRASH BOUNDARIES RECOVERED`);
+{
+  const h = new ResumeHarness({ crashes: { "git push -u": { when: "before" } } });
+  try {
+    h.persist(h.state({ phase: PHASE.BUILD, inner: BUILD_INNER.PUSH }));
+    await assert.rejects(h.resume(), /simulated crash/);
+    assert.equal(rt.loopActive, false, "throwing chain must clear loopActive");
+    assert.equal(rt.runCtx, null, "throwing chain must clear runCtx");
+    assert.equal(existsSync(join(h.root, LOOP_LOCK_FILE)), false, "throwing chain must release lock");
+    assert.ok(h.notifications.some((entry) => entry.message.includes("unexpected failure")));
+    await h.resume();
+    assert.equal(h.stateExists(), false, "same live process must be able to resume after a thrown failure");
+  } finally {h.dispose();}
+}
+
+console.log(`ALL ${cases.length * 2} CRASH BOUNDARIES + LIVE-PROCESS THROW RECOVERY PASSED`);

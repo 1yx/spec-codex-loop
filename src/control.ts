@@ -1,5 +1,7 @@
 import { closeSync, existsSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { BUILD_INNER, PHASE, REVIEW_INNER, isPhase, type Phase } from "./lifecycle-state.ts";
 import {
   FETCH_SENTINEL,
@@ -72,6 +74,7 @@ function normalizeLoopState(value: unknown): LoopState | null {
     head: stringOr(raw.head, ""),
     repo: stringOr(raw.repo, ""),
     triggerAt: nullableString(raw.triggerAt, null),
+    triggerNonce: nullableString(raw.triggerNonce, null),
     reviewDeadline: nullableNumber(raw.reviewDeadline),
     seenSignatures: stringArray(raw.seenSignatures),
     suggestions: suggestionArray(raw.suggestions),
@@ -133,32 +136,80 @@ export function clearLoopState(repoRoot: string, change: string): void {
 export function acquireLoopLock(ctx: LoopCtx): boolean {
   const path = join(ctx.cwd, LOOP_LOCK_FILE);
   if (rt.loopLockPath === path) {return false;}
-  try {return createLoopLock(path);} catch { /* inspect existing owner below */ }
-  const pid = readLockPid(path);
-  if (pid !== null && pid !== process.pid && isProcessAlive(pid)) {
-    ctx.ui.notify(`dev-loop: another process (${pid}) owns ${LOOP_LOCK_FILE}`, "warning");
+  const db = acquireLockDatabase(ctx, path);
+  if (!db) {return false;}
+  const owner = readLockOwner(path);
+  if (owner.pid !== null && owner.pid !== process.pid && isProcessAlive(owner.pid)) {
+    ctx.ui.notify(`dev-loop: another process (${owner.pid}) owns ${LOOP_LOCK_FILE}`, "warning");
+    closeLockDatabase(db);
     return false;
   }
-  try {unlinkSync(path); return createLoopLock(path);} catch {
-    ctx.ui.notify(`dev-loop: cannot acquire ${LOOP_LOCK_FILE}`, "error");
+  try {
+    unlinkSync(path);
+  } catch { /* absent legacy/stale owner */ }
+  try {
+    unlinkSync(`${path}.reclaim`);
+  } catch { /* legacy recovery guard is no longer authoritative */ }
+  try {
+    createLoopLock(path);
+    rt.loopLockDb = db;
+    return true;
+  } catch {
+    closeLockDatabase(db);
+    ctx.ui.notify(`dev-loop: cannot create ${LOOP_LOCK_FILE}`, "error");
     return false;
   }
+}
+
+/** Acquire an OS-backed transaction that is released automatically on crash. */
+function acquireLockDatabase(ctx: LoopCtx, ownerPath: string): DatabaseSync | null {
+  let db: DatabaseSync | null = null;
+  try {
+    db = new DatabaseSync(`${ownerPath}.sqlite`);
+    db.exec("PRAGMA busy_timeout = 0; BEGIN EXCLUSIVE;");
+    return db;
+  } catch {
+    if (db) {try {db.close();} catch { /* already closed */ }}
+    const owner = readLockOwner(ownerPath);
+    const detail = owner.pid === null ? "another process" : `process ${owner.pid}`;
+    ctx.ui.notify(`dev-loop: ${detail} owns ${LOOP_LOCK_FILE}`, "warning");
+    return null;
+  }
+}
+
+/** Release the SQLite transaction without masking the caller's cleanup path. */
+function closeLockDatabase(db: { exec(sql: string): void; close(): void }): void {
+  try {db.exec("ROLLBACK;");} catch { /* transaction may already be gone */ }
+  try {db.close();} catch { /* already closed */ }
 }
 
 /** Atomically create and record ownership of a repository lock. */
 function createLoopLock(path: string): true {
   const fd = openSync(path, "wx");
-  try {writeFileSync(fd, JSON.stringify({ pid: process.pid, startedAt: Temporal.Now.instant().toString() }));} finally {closeSync(fd);}
+  const token = randomUUID();
+  try {
+    writeFileSync(fd, JSON.stringify({ pid: process.pid, token, startedAt: Temporal.Now.instant().toString() }));
+  } catch (error) {
+    try {unlinkSync(path);} catch { /* best effort */ }
+    throw error;
+  } finally {closeSync(fd);}
   rt.loopLockPath = path;
+  rt.loopLockToken = token;
   return true;
 }
 
+/** Parsed identity recorded in a repository lock file. */
+type LockOwner = { pid: number | null; token: string | null };
+
 /** Read an existing lock owner; malformed lock files have no owner. */
-function readLockPid(path: string): number | null {
+function readLockOwner(path: string): LockOwner {
   try {
     const raw = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
-    return typeof raw.pid === "number" ? raw.pid : null;
-  } catch {return null;}
+    return {
+      pid: typeof raw.pid === "number" ? raw.pid : null,
+      token: typeof raw.token === "string" ? raw.token : null,
+    };
+  } catch {return { pid: null, token: null };}
 }
 
 /** Probe process liveness without sending a signal. */
@@ -169,8 +220,14 @@ function isProcessAlive(pid: number): boolean {
 /** Release the project lock owned by this runtime. */
 export function releaseLoopLock(): void {
   if (!rt.loopLockPath) {return;}
-  try {unlinkSync(rt.loopLockPath);} catch { /* already gone */ }
+  const owner = readLockOwner(rt.loopLockPath);
+  if (owner.token !== null && owner.token === rt.loopLockToken) {
+    try {unlinkSync(rt.loopLockPath);} catch { /* already gone */ }
+  }
+  if (rt.loopLockDb) {closeLockDatabase(rt.loopLockDb);}
   rt.loopLockPath = null;
+  rt.loopLockToken = null;
+  rt.loopLockDb = null;
 }
 
 // --- review_wait timer --------------------------------------------------------

@@ -6,7 +6,7 @@ export function normalizeResumeState(s: LoopState): boolean {
   let changed = false;
   // A stopped PROBE may have been repaired manually with a new pushed HEAD.
   if (s.stopReason && s.phase === PHASE.REVIEW && s.inner === REVIEW_INNER.PROBE) {
-    s.inner = REVIEW_INNER.RECONCILE; s.triggerAt = null; s.reviewDeadline = null;
+    s.inner = REVIEW_INNER.RECONCILE; s.triggerAt = null; s.triggerNonce = null; s.reviewDeadline = null;
     changed = true;
   }
   // Legacy FIX states omitted suggestions; re-probe without tripping repeat.
