@@ -370,6 +370,24 @@ async function handleReview(step: StepCtx): Promise<StepOutcome> {
  */
 async function handleArchive(step: StepCtx): Promise<StepOutcome> {
   const { pi, ctx, change, s, wtDir, persist } = step;
+  // Reconcile main before archiving: PROBE→ARCHIVE skips RECONCILE, so if
+  //  origin/main advanced after the last reconcile (e.g. another PR merged),
+  //  archive against the latest main or the delta sync + archive/ path diverge
+  //  from main (the #25/#26 spec clash). Conflict -> stop for resolution.
+  await run(pi, ["git", "fetch", "origin", "main"], wtDir);
+  const { code: mc } = await run(pi, ["git", "merge", "origin/main", "--no-edit"], wtDir);
+  if (mc !== 0) {
+    await run(pi, ["git", "merge", "--abort"], wtDir);
+    s.stopReason = "archive_main_conflict"; rt.interruptedChange = change;
+    ctx.ui.notify(`dev-loop: origin/main conflicts before archive (round ${s.round}); stopping — resolve then /loop resume`, "warning");
+    persist(); return "stop";
+  }
+  const { code: rpc, stderr: rpe } = await run(pi, ["git", "push"], wtDir);
+  if (rpc !== 0) {
+    s.stopReason = "archive_push_failed"; rt.interruptedChange = change;
+    ctx.ui.notify(`dev-loop: push of main-reconcile before archive failed (${rpe}); stopping — fix then /loop resume`, "error");
+    persist(); return "stop";
+  }
   const wtChangeDir = join(wtDir, "openspec", "changes", change);
   if (existsSync(wtChangeDir)) {
     const { code, stderr } = await run(pi, ["openspec", "archive", change, "-y"], wtDir);
