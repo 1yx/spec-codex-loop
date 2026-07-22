@@ -4,6 +4,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 export const FETCH_SENTINEL = ".dev-loop-fetch";
 export const STOP_SENTINEL = ".dev-loop-stop";
 export const LOOP_STATE_FILE = ".loop-state.json";
+export const LOOP_LOCK_FILE = ".dev-loop.lock";
 export const WORKTREE_ROOT = ".worktree";
 export const POLL_TICK_MS = 1000;
 export const REVIEW_WAIT_MS = 2 * 60_000; // poll interval between Codex fetches
@@ -127,6 +128,7 @@ type RtState = {
   sentinelTicker: NodeJS.Timeout | null;
   turnResolve: ((result: AgentTurnResult) => void) | null;
   turnResult: AgentTurnResult | null;
+  loopLockPath: string | null;
   /** Loop wake callback (set by the entry; control/timer trigger it without
    *  importing the pipeline, avoiding a control↔pipeline import cycle). */
   wakeLoop: (() => void | Promise<void>) | null;
@@ -144,6 +146,7 @@ export const rt: RtState = {
   sentinelTicker: null,
   turnResolve: null,
   turnResult: null,
+  loopLockPath: null,
   wakeLoop: null,
 };
 

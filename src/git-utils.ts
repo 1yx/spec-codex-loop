@@ -179,25 +179,31 @@ export async function syncMain(pi: ExtensionAPI, ctx: LoopCtx, repoRoot: string)
 }
 
 // --- origin reconciliation (change branch + main) ------------------------------
-/** Reconcile the change branch with origin: sync origin/<change> (ff-push or
- *  detect divergence), then check GitHub's authoritative `mergeable_state` for
- *  whether main advanced. `behind` → clean main merge (auto-committed, caller
- *  pushes); `dirty` → conflict (caller hands to an agent turn with the change's
- *  context); `clean`/`unknown`/else → nothing to do now. */
+/** Align local and remote change heads when one is a strict ancestor. */
+async function syncChangeBranch(pi: ExtensionAPI, wtDir: string, change: string): Promise<ReconcileResult> {
+  let { stdout: localHead } = await run(pi, ["git", "rev-parse", "HEAD"], wtDir);
+  const { stdout: remoteHead } = await run(pi, ["git", "rev-parse", `origin/${change}`], wtDir);
+  if (!remoteHead || !localHead || remoteHead === localHead) {return { kind: "ok", head: localHead };}
+  const { code: localAhead } = await run(pi, ["git", "merge-base", "--is-ancestor", remoteHead, localHead], wtDir);
+  if (localAhead === 0) {
+    const { code, stderr } = await run(pi, ["git", "push"], wtDir);
+    return code === 0 ? { kind: "ok", head: localHead } : { kind: "sync_push_failed", stderr };
+  }
+  const { code: remoteAhead } = await run(pi, ["git", "merge-base", "--is-ancestor", localHead, remoteHead], wtDir);
+  if (remoteAhead !== 0) {return { kind: "diverged" };}
+  const { code: pullCode } = await run(pi, ["git", "merge", "--ff-only", `origin/${change}`], wtDir);
+  if (pullCode !== 0) {return { kind: "diverged" };}
+  ({ stdout: localHead } = await run(pi, ["git", "rev-parse", "HEAD"], wtDir));
+  return { kind: "ok", head: localHead };
+}
+
+/** Sync origin/<change>, then reconcile origin/main from PR mergeability. */
 export async function reconcileBranch(pi: ExtensionAPI, ids: { repo: string; prNum: number; wtDir: string; change: string }): Promise<ReconcileResult> {
   const { repo, prNum, wtDir, change } = ids;
   await run(pi, ["git", "fetch", "origin", "main", change], wtDir);
-  const { stdout: localHead } = await run(pi, ["git", "rev-parse", "HEAD"], wtDir);
-  const { stdout: remoteHead } = await run(pi, ["git", "rev-parse", `origin/${change}`], wtDir);
-  if (remoteHead && localHead && remoteHead !== localHead) {
-    const { code: ffCode } = await run(pi, ["git", "merge-base", "--is-ancestor", remoteHead, localHead], wtDir);
-    if (ffCode === 0) {
-      const { code, stderr } = await run(pi, ["git", "push"], wtDir);
-      if (code !== 0) {return { kind: "sync_push_failed", stderr };}
-    } else {
-      return { kind: "diverged" };
-    }
-  }
+  const sync = await syncChangeBranch(pi, wtDir, change);
+  if (sync.kind !== "ok") {return sync;}
+  const localHead = sync.head;
   const { stdout: ms } = await run(pi, ["gh", "api", `repos/${repo}/pulls/${prNum}`, "-q", ".mergeable_state"]);
   const state = ms.trim().toLowerCase();
   if (state === "behind") {

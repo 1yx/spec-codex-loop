@@ -99,7 +99,7 @@ pnpm typecheck
 pnpm lint
 ```
 
-`/loop resume` 的集成测试通过注册后的真实命令入口和临时磁盘状态运行，覆盖全部 11 个持久化 phase/inner 重入点，以及 429、自动重试、部分提交、未完成 merge、Git/GitHub 瞬时失败、Codex quota/error、旧 FIX 状态、多 stopped changes、`/loop stop` 和 stale timer/sentinel 的恢复。
+测试通过注册后的真实命令入口、临时磁盘状态和临时裸 Git 远端运行。覆盖全部 11 个持久化 phase/inner 重入点，以及 429/自动重试、真实 Git 分支同步与冲突、每个外部副作用前后的崩溃恢复、GitHub 分页与旧 head 隔离、完整非 resume 主流程、状态兼容与原子写、进程锁、`/loop stop` 和 timer/sentinel 竞态。
 
 ### First-time setup
 

@@ -3,8 +3,10 @@ import { cpSync, existsSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import { BUILD_INNER, PHASE, REVIEW_INNER } from "./lifecycle-state.ts";
 import { stopForAgentFailure } from "./agent-turn.ts";
+import { normalizeResumeState } from "./resume-state.ts";
 import {
   FETCH_SENTINEL,
+  LOOP_LOCK_FILE,
   LOOP_STATE_FILE,
   REVIEW_TOTAL_TIMEOUT_MS,
   REVIEW_WAIT_MS,
@@ -29,9 +31,9 @@ import {
   run,
   syncMain,
 } from "./git-utils.ts";
-import { latestCommentAt, readCodexVerdict, shortSha, suggestionKey } from "./codex.ts";
+import { latestCommentAt, readCodexVerdict, reviewTriggerAt, shortSha, suggestionKey } from "./codex.ts";
 import { buildImplement, fixPhase, resolveMainPhase } from "./phases.ts";
-import { clearLoopState, readLoopState, scheduleWait, stopSentinelTicker, waitAction, writeLoopState } from "./control.ts";
+import { clearLoopState, readLoopState, releaseLoopLock, scheduleWait, stopSentinelTicker, waitAction, writeLoopState } from "./control.ts";
 
 /**
  * Outcome of a oneStep transition: continue / suspend (review_wait) / done / stop.
@@ -92,6 +94,7 @@ async function clearRunArtifacts(pi: ExtensionAPI, repoRoot: string): Promise<vo
   await ensureLocalIgnore(pi, repoRoot, `${WORKTREE_ROOT}/`);
   await ensureLocalIgnore(pi, repoRoot, FETCH_SENTINEL);
   await ensureLocalIgnore(pi, repoRoot, STOP_SENTINEL);
+  await ensureLocalIgnore(pi, repoRoot, LOOP_LOCK_FILE);
   await ensureLocalIgnore(pi, repoRoot, LOOP_STATE_FILE);
 }
 
@@ -308,16 +311,21 @@ async function handleProbe(step: StepCtx): Promise<StepOutcome> {
  */
 async function handleTrigger(step: StepCtx): Promise<StepOutcome> {
   const { pi, ctx, s, persist } = step;
-  const { code, stderr } = await run(pi, ["gh", "pr", "comment", String(s.prNum), "--body", "@codex review", "--repo", s.repo]);
-  if (code !== 0) {
-    s.stopReason = "trigger_failed";
-    ctx.ui.notify(`dev-loop: trigger @codex review failed: ${stderr}`, "error");
-    persist(); return "stop";
+  let triggerAt = await reviewTriggerAt(pi, { repo: s.repo, prNum: s.prNum, head: s.head });
+  if (!triggerAt) {
+    const body = `@codex review\n<!-- spec-codex-loop:${s.head} -->`;
+    const { code, stderr } = await run(pi, ["gh", "pr", "comment", String(s.prNum), "--body", body, "--repo", s.repo]);
+    if (code !== 0) {
+      s.stopReason = "trigger_failed";
+      ctx.ui.notify(`dev-loop: trigger @codex review failed: ${stderr}`, "error");
+      persist(); return "stop";
+    }
+    triggerAt = await latestCommentAt(pi, s.repo, s.prNum);
   }
   // latestCommentAt can return "" right after the post (GitHub eventual
   //  consistency on the issues/comments index, or an empty result). Fall back
   //  to local time so !s.triggerAt can never re-fire @codex review each cycle.
-  s.triggerAt = (await latestCommentAt(pi, s.repo, s.prNum)) || Temporal.Now.instant().toString();
+  s.triggerAt = triggerAt || Temporal.Now.instant().toString();
   s.reviewDeadline = Temporal.Now.instant().epochMilliseconds + REVIEW_TOTAL_TIMEOUT_MS;
   s.inner = REVIEW_INNER.PROBE;
   ctx.ui.notify(`dev-loop: round ${s.round} on ${shortSha(s.head)} — triggered @codex review, polling every ${REVIEW_WAIT_MS / 60000}min (≤${REVIEW_TOTAL_TIMEOUT_MS / 60000}min; touch ${FETCH_SENTINEL} to recheck)…`, "info");
@@ -426,17 +434,19 @@ async function handleArchive(step: StepCtx): Promise<StepOutcome> {
       ctx.ui.notify(`dev-loop: openspec archive failed: ${stderr}; stopping (PR + worktree left)`, "warning");
       persist(); return "stop";
     }
-    if (!s.oneOff) {markChangeDone(wtDir, change);}
-    const { stdout: dirty } = await run(pi, ["git", "status", "--porcelain"], wtDir);
-    if (dirty) {
-      await run(pi, ["git", "add", "-A"], wtDir);
-      await run(pi, ["git", "commit", "-m", `chore: archive ${change}`], wtDir);
-      const { code: pc, stderr: pe } = await run(pi, ["git", "push"], wtDir);
-      if (pc !== 0) {
-        s.stopReason = "archive_push_failed"; rt.interruptedChange = change;
-        ctx.ui.notify(`dev-loop: git push of archive commit failed (${pe}); stopping — fix then /loop resume`, "error");
-        persist(); return "stop";
-      }
+  }
+  // These steps also run when a previous process completed `openspec archive`
+  // and crashed before committing its working-tree changes.
+  if (!s.oneOff) {markChangeDone(wtDir, change);}
+  const { stdout: dirty } = await run(pi, ["git", "status", "--porcelain"], wtDir);
+  if (dirty) {
+    await run(pi, ["git", "add", "-A"], wtDir);
+    await run(pi, ["git", "commit", "-m", `chore: archive ${change}`], wtDir);
+    const { code: pc, stderr: pe } = await run(pi, ["git", "push"], wtDir);
+    if (pc !== 0) {
+      s.stopReason = "archive_push_failed"; rt.interruptedChange = change;
+      ctx.ui.notify(`dev-loop: git push of archive commit failed (${pe}); stopping — fix then /loop resume`, "error");
+      persist(); return "stop";
     }
   }
   s.phase = PHASE.MERGE; persist(); return "cont";
@@ -446,9 +456,15 @@ async function handleArchive(step: StepCtx): Promise<StepOutcome> {
  * MERGE: gh pr merge --squash --delete-branch.
  */
 async function handleMerge(step: StepCtx): Promise<StepOutcome> {
-  const { pi, ctx, s, persist } = step;
+  const { pi, ctx, change, s, persist } = step;
+  if ((await prStateFor(pi, s.repo, change)).merged) {
+    s.phase = PHASE.CLEANUP; persist(); return "cont";
+  }
   const { code, stderr } = await run(pi, ["gh", "pr", "merge", String(s.prNum), "--squash", "--delete-branch", "--repo", s.repo]);
   if (code !== 0) {
+    if ((await prStateFor(pi, s.repo, change)).merged) {
+      s.phase = PHASE.CLEANUP; persist(); return "cont";
+    }
     s.stopReason = "merge_failed";
     ctx.ui.notify(`dev-loop: gh pr merge failed: ${stderr}`, "error");
     persist(); return "stop";
@@ -461,8 +477,9 @@ async function handleMerge(step: StepCtx): Promise<StepOutcome> {
  */
 async function handleCleanup(step: StepCtx): Promise<StepOutcome> {
   const { pi, ctx, change } = step;
-  await removeWorktree(pi, ctx.cwd, change);
   await syncMain(pi, ctx, ctx.cwd);
+  // State lives inside the worktree, so removal must be the final side effect.
+  await removeWorktree(pi, ctx.cwd, change);
   return "done";
 }
 
@@ -501,25 +518,6 @@ async function rederiveState(pi: ExtensionAPI, ctx: LoopCtx, change: string): Pr
   const s = seedFromPrefix(r, rt.runCtx?.oneOff ?? false);
   if (s) {writeLoopState(ctx.cwd, change, s);}
   return s ? { s } : "aborted";
-}
-
-/** Normalize persisted stop/legacy state into a safe re-entry point. */
-function normalizeResumeState(s: LoopState): boolean {
-  let changed = false;
-  // A stopped PROBE may have been repaired manually with a new pushed HEAD.
-  // Reconcile first and discard the old review trigger before probing again.
-  if (s.stopReason && s.phase === PHASE.REVIEW && s.inner === REVIEW_INNER.PROBE) {
-    s.inner = REVIEW_INNER.RECONCILE; s.triggerAt = null; s.reviewDeadline = null;
-    changed = true;
-  }
-  // Legacy FIX states omitted suggestions; re-probe without tripping repeat.
-  if (s.phase === PHASE.REVIEW && s.inner === REVIEW_INNER.FIX && s.suggestions.length === 0) {
-    s.inner = REVIEW_INNER.RECONCILE;
-    s.seenSignatures.pop();
-    changed = true;
-  }
-  if (s.stopReason) {s.stopReason = null; changed = true;}
-  return changed;
 }
 
 /** Read persisted state; normalize stopped re-entry points before driving. */
@@ -562,7 +560,7 @@ function handleCompleted(ctx: LoopCtx): "chain" | "done" {
     const next = pickTask(ctx.cwd);
     if (next) { rt.runCtx = { ...rt.runCtx, change: next.text }; return "chain"; }
   }
-  rt.loopActive = false; stopSentinelTicker(); rt.runCtx = null;
+  rt.loopActive = false; stopSentinelTicker(); rt.runCtx = null; releaseLoopLock();
   return "done";
 }
 
@@ -571,7 +569,7 @@ function handleCompleted(ctx: LoopCtx): "chain" | "done" {
  */
 function endChain(change: string, stopped: boolean): void {
   if (stopped) {rt.interruptedChange = change;}
-  rt.loopActive = false; stopSentinelTicker(); rt.runCtx = null;
+  rt.loopActive = false; stopSentinelTicker(); rt.runCtx = null; releaseLoopLock();
 }
 
 /**

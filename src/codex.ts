@@ -40,6 +40,19 @@ type GhInlineComment = {
   commit_id?: string;
 } & GhComment
 
+/** Read every page from a GitHub array endpoint. The first-page URL stays
+ * compatible with existing gh mocks; later pages are requested only when full. */
+async function ghJsonAll<T>(pi: ExtensionAPI, endpoint: string): Promise<T[]> {
+  const all: T[] = [];
+  for (let page = 1; ; page++) {
+    const suffix = page === 1 ? "?per_page=100" : `?per_page=100&page=${page}`;
+    const items = await ghJson<T[]>(pi, `${endpoint}${suffix}`);
+    if (!items) {return all;}
+    all.push(...items);
+    if (items.length < 100) {return all;}
+  }
+}
+
 /**
  * True if the comment/review author is the Codex bot.
  */
@@ -101,9 +114,15 @@ function passCommit(body: string): string | null {
  *  just-posted `@codex review` trigger so quota detection can be gated on
  *  freshness (GitHub's clock, not local). */
 export async function latestCommentAt(pi: ExtensionAPI, repo: string, prNum: number): Promise<string> {
-  const comments =
-    (await ghJson<GhComment[]>(pi, `repos/${repo}/issues/${prNum}/comments?per_page=100`)) ?? [];
+  const comments = await ghJsonAll<GhComment>(pi, `repos/${repo}/issues/${prNum}/comments`);
   return comments[comments.length - 1]?.created_at ?? "";
+}
+
+/** Timestamp of a trigger previously posted for this exact head. */
+export async function reviewTriggerAt(pi: ExtensionAPI, ids: { repo: string; prNum: number; head: string }): Promise<string> {
+  const marker = `<!-- spec-codex-loop:${ids.head} -->`;
+  const comments = await ghJsonAll<GhComment>(pi, `repos/${ids.repo}/issues/${ids.prNum}/comments`);
+  return comments.findLast((comment) => comment.body.includes(marker))?.created_at ?? "";
 }
 
 /** True if any Codex issue comment is a pass verdict for head7. */
@@ -115,10 +134,7 @@ function passCommentForHead(codexIssue: GhComment[], head7: string): boolean {
  *  when it doesn't leave a comment). Observed on endurance-race PR #22. */
 async function codexThumbsUp(pi: ExtensionAPI, v: { repo: string; prNum: number; triggerAt: string }): Promise<boolean> {
   const reactions =
-    (await ghJson<Array<{ user?: { login: string }; content: string; created_at: string }>>(
-      pi,
-      `repos/${v.repo}/issues/${v.prNum}/reactions?per_page=100`
-    )) ?? [];
+    await ghJsonAll<{ user?: { login: string }; content: string; created_at: string }>(pi, `repos/${v.repo}/issues/${v.prNum}/reactions`);
   return reactions.some((r) => isCodex(r.user?.login) && r.content === "+1" && r.created_at > v.triggerAt);
 }
 
@@ -129,23 +145,21 @@ function codexQuotaAfter(codexIssue: GhComment[], triggerAt: string): boolean {
 
 /** True if Codex posted any issue comment after triggerAt (unclassified reply). */
 function codexReplyAfter(codexIssue: GhComment[], triggerAt: string): boolean {
-  return codexIssue.some((c) => c.created_at > triggerAt);
+  return codexIssue.some((c) => c.created_at > triggerAt && !PASS_RE.test(c.body));
 }
 
 /** Read Codex's inline suggestions for head. null = no Codex review on this
  *  commit; empty array = reviewed with no suggestions (pass); non-empty = fail. */
 async function readHeadSuggestions(pi: ExtensionAPI, ids: { repo: string; prNum: number; head7: string }): Promise<Suggestion[] | null> {
   const { repo, prNum, head7 } = ids;
-  const reviews =
-    (await ghJson<GhReview[]>(pi, `repos/${repo}/pulls/${prNum}/reviews?per_page=100`)) ?? [];
+  const reviews = await ghJsonAll<GhReview>(pi, `repos/${repo}/pulls/${prNum}/reviews`);
   const headReviewIds = new Set(
     reviews
       .filter((r): r is GhReview & { id: number } => isCodex(r.user?.login) && shortSha(r.commit_id ?? "") === head7 && r.id != null)
       .map((r) => r.id)
   );
   if (headReviewIds.size === 0) {return null;}
-  const inline =
-    (await ghJson<GhInlineComment[]>(pi, `repos/${repo}/pulls/${prNum}/comments?per_page=100`)) ?? [];
+  const inline = await ghJsonAll<GhInlineComment>(pi, `repos/${repo}/pulls/${prNum}/comments`);
   return inline
     .filter((c) => isCodex(c.user?.login) && c.pull_request_review_id != null && headReviewIds.has(c.pull_request_review_id))
     .map(parseSuggestion)
@@ -163,8 +177,7 @@ export async function readCodexVerdict(
 ): Promise<PollResult | null> {
   const { repo, prNum, head, triggerAt } = v;
   const head7 = shortSha(head);
-  const issueComments =
-    (await ghJson<GhComment[]>(pi, `repos/${repo}/issues/${prNum}/comments?per_page=100`)) ?? [];
+  const issueComments = await ghJsonAll<GhComment>(pi, `repos/${repo}/issues/${prNum}/comments`);
   const codexIssue = issueComments.filter((c) => isCodex(c.user?.login));
 
   if (passCommentForHead(codexIssue, head7)) {

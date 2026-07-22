@@ -1,14 +1,30 @@
 import type { AgentEndEvent, ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { existsSync, readdirSync, unlinkSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
-import { FETCH_SENTINEL, STOP_SENTINEL, WORKTREE_ROOT, rt, type LoopCtx, type LoopState } from "./runtime.ts";
+import { join, relative } from "node:path";
+import { FETCH_SENTINEL, LOOP_LOCK_FILE, STOP_SENTINEL, WORKTREE_ROOT, rt, type LoopCtx, type LoopState } from "./runtime.ts";
 import { ensureLocalIgnore, findTodoFile, pickTask, removeFromLocalIgnore, run } from "./git-utils.ts";
-import { clearWaitTimer, readLoopState, startSentinelTicker, writeControl } from "./control.ts";
+import { acquireLoopLock, clearWaitTimer, readLoopState, startSentinelTicker, writeControl } from "./control.ts";
 import { shortSha } from "./codex.ts";
 import { checkPreconditions } from "./phases.ts";
 import { runLoopChain } from "./pipeline.ts";
 
 // --- project init (/loop init) ------------------------------------------------
+/** Commit newly-created loop artifacts so future worktrees inherit them. */
+async function trackInitArtifacts(pi: ExtensionAPI, ctx: LoopCtx, todoPath: string): Promise<void> {
+  const cwd = ctx.cwd;
+  const todoRel = relative(cwd, todoPath);
+  const { stdout: todoTracked } = await run(pi, ["git", "ls-files", "--", todoRel], cwd);
+  const { stdout: osTracked } = await run(pi, ["git", "ls-files", "--", "openspec/"], cwd);
+  const added: string[] = [];
+  if (!todoTracked.trim()) {await run(pi, ["git", "add", todoRel], cwd); added.push(todoRel);}
+  if (existsSync(join(cwd, "openspec")) && !osTracked.trim()) {await run(pi, ["git", "add", "openspec/"], cwd); added.push("openspec/");}
+  if (added.length === 0) {return;}
+  const commit = await run(pi, ["git", "commit", "-m", "chore: initialize spec-codex-loop"], cwd);
+  if (commit.code !== 0) {return;}
+  const push = await run(pi, ["git", "push", "origin", "main"], cwd);
+  ctx.ui.notify(push.code === 0 ? `dev-loop: committed + pushed ${added.join(" + ")} to main` : `dev-loop: initialization committed locally but push failed (${push.stderr})`, push.code === 0 ? "info" : "warning");
+}
+
 /**
  * `/loop init`: create TODO.md, git-ignore .worktree/, scaffold openspec.
  */
@@ -34,6 +50,7 @@ async function initProject(pi: ExtensionAPI, ctx: LoopCtx): Promise<void> {
   }
   await removeFromLocalIgnore(pi, cwd, "TODO.md");
   await ensureLocalIgnore(pi, cwd, `${WORKTREE_ROOT}/`);
+  await ensureLocalIgnore(pi, cwd, LOOP_LOCK_FILE);
   if (existsSync(join(cwd, "openspec"))) {
     ctx.ui.notify("dev-loop: openspec/ already present", "info");
   } else {
@@ -41,17 +58,7 @@ async function initProject(pi: ExtensionAPI, ctx: LoopCtx): Promise<void> {
     if (code === 0) {ctx.ui.notify("dev-loop: ran `openspec init --tools pi`", "info");}
     else {ctx.ui.notify(`dev-loop: openspec init failed: ${stderr}`, "error");}
   }
-  // Track openspec/ on main so worktrees cut from origin/main inherit it (no
-  //  copy). Idempotent: only commits when openspec/ is untracked.
-  const { stdout: osTracked } = await run(pi, ["git", "ls-files", "--", "openspec/"], cwd);
-  if (existsSync(join(cwd, "openspec")) && !osTracked.trim()) {
-    await run(pi, ["git", "add", "openspec/"], cwd);
-    const c = await run(pi, ["git", "commit", "-m", "chore: track openspec/"], cwd);
-    if (c.code === 0) {
-      const p = await run(pi, ["git", "push", "origin", "main"], cwd);
-      ctx.ui.notify(p.code === 0 ? "dev-loop: committed + pushed openspec/ to main" : `dev-loop: openspec/ committed locally but push failed (${p.stderr})`, p.code === 0 ? "info" : "warning");
-    }
-  }
+  await trackInitArtifacts(pi, ctx, todoPath);
 }
 
 // --- /loop subcommand handlers ------------------------------------------------
@@ -95,38 +102,52 @@ function handleStatus(ctx: LoopCtx): void {
   for (const { change, s } of found) {notifyStatusEntry(ctx, change, s);}
 }
 
+/** Claim this repository before exposing an active runtime to async callbacks. */
+function beginRun(ctx: LoopCtx, runCtx: NonNullable<typeof rt.runCtx>): boolean {
+  if (rt.loopActive) {
+    ctx.ui.notify(`dev-loop: already running "${rt.runCtx?.change ?? "unknown"}"`, "warning");
+    return false;
+  }
+  if (!acquireLoopLock(ctx)) {return false;}
+  rt.runCtx = runCtx;
+  rt.loopActive = true;
+  rt.stopRequested = false;
+  rt.fetchRequested = false;
+  clearWaitTimer(runCtx.change);
+  startSentinelTicker(ctx);
+  return true;
+}
+
 /**
  * `/loop resume`: re-enter the change last stopped via `/loop stop`.
  */
 async function handleResume(pi: ExtensionAPI, ctx: LoopCtx): Promise<void> {
   let ch = rt.interruptedChange;
   if (!ch) {
-    // interruptedChange is in-memory only and is lost on pi restart; fall back
-    //  to disk state — resume a change whose .loop-state.json shows it stopped.
-    const stopped = scanLoopStates(ctx.cwd).filter((x) => x.s.stopReason).map((x) => x.change);
-    if (stopped.length === 0) {
-      ctx.ui.notify("dev-loop: nothing to resume (no change stopped via /loop stop)", "info");
+    // Prefer explicit stopped states. If none exist, a unique persisted state
+    // is a crash-recovery candidate (the process may have died before writing a stopReason).
+    const found = scanLoopStates(ctx.cwd);
+    const stopped = found.filter((x) => x.s.stopReason);
+    const candidates = stopped.length > 0 ? stopped : found;
+    if (candidates.length === 0) {
+      ctx.ui.notify("dev-loop: nothing to resume (no persisted loop state)", "info");
       return;
     }
-    if (stopped.length > 1) {
-      ctx.ui.notify(`dev-loop: multiple stopped changes (${stopped.join(", ")}); specify one with /loop <change>`, "info");
+    if (candidates.length > 1) {
+      ctx.ui.notify(`dev-loop: multiple resumable changes (${candidates.map((x) => x.change).join(", ")}); specify one with /loop <change>`, "info");
       return;
     }
-    ch = stopped[0];
+    ch = candidates[0].change;
     ctx.ui.notify(`dev-loop: interruptedChange lost on restart — resuming "${ch}" from disk state`, "info");
   }
   if (!(await checkPreconditions(pi, ctx))) {return;}
   ctx.ui.notify(`dev-loop: resuming "${ch}"`, "info");
-  rt.runCtx = { ctx, change: ch, dryRun: false, all: false, oneOff: true };
-  rt.loopActive = true;
-  rt.stopRequested = false;
-  rt.fetchRequested = false;
+  const runCtx = { ctx, change: ch, dryRun: false, all: false, oneOff: true };
+  if (!beginRun(ctx, runCtx)) {return;}
   // Clear stale sentinels left by a touch while no loop was running.
   for (const s of [FETCH_SENTINEL, STOP_SENTINEL]) {
     try { unlinkSync(join(ctx.cwd, s)); } catch { /* already gone */ }
   }
-  clearWaitTimer(ch);
-  startSentinelTicker(ctx);
   await runLoopChain();
 }
 
@@ -153,11 +174,8 @@ async function handleNormalRun(pi: ExtensionAPI, ctx: LoopCtx, tokens: string[])
     }
     firstChange = t.text;
   }
-  rt.runCtx = { ctx, change: firstChange, dryRun, all, oneOff: !!oneOff };
-  rt.loopActive = true;
-  rt.stopRequested = false;
-  clearWaitTimer(firstChange);
-  startSentinelTicker(ctx);
+  const runCtx = { ctx, change: firstChange, dryRun, all, oneOff: !!oneOff };
+  if (!beginRun(ctx, runCtx)) {return;}
   await runLoopChain();
 }
 

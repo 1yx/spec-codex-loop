@@ -310,7 +310,7 @@ async function multipleStoppedChangesAreNotGuessed(): Promise<void> {
     assert.equal(h.stateExists("change-a"), true);
     assert.equal(h.stateExists("change-b"), true);
     assert.equal(h.commands.length, 0);
-    assert.ok(h.notifications.some((n) => n.message.includes("multiple stopped changes")));
+    assert.ok(h.notifications.some((n) => n.message.includes("multiple resumable changes")));
   } finally {
     h.dispose();
   }
