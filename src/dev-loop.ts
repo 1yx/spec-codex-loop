@@ -105,11 +105,11 @@ async function handleResume(pi: ExtensionAPI, ctx: LoopCtx): Promise<void> {
     //  to disk state — resume a change whose .loop-state.json shows it stopped.
     const stopped = scanLoopStates(ctx.cwd).filter((x) => x.s.stopReason).map((x) => x.change);
     if (stopped.length === 0) {
-      ctx.ui.notify("dev-loop: nothing to resume (no change stopped via /loop stop)", "warning");
+      ctx.ui.notify("dev-loop: nothing to resume (no change stopped via /loop stop)", "info");
       return;
     }
     if (stopped.length > 1) {
-      ctx.ui.notify(`dev-loop: multiple stopped changes (${stopped.join(", ")}); specify one with /loop <change>`, "warning");
+      ctx.ui.notify(`dev-loop: multiple stopped changes (${stopped.join(", ")}); specify one with /loop <change>`, "info");
       return;
     }
     ch = stopped[0];
@@ -148,7 +148,7 @@ async function handleNormalRun(pi: ExtensionAPI, ctx: LoopCtx, tokens: string[])
   } else {
     const t = pickTask(cwd);
     if (!t) {
-      ctx.ui.notify("dev-loop: no unchecked `- [ ] <change>` line in TODO.md", "warning");
+      ctx.ui.notify("dev-loop: no unchecked `- [ ] <change>` line in TODO.md", "info");
       return;
     }
     firstChange = t.text;

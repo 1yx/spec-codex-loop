@@ -140,7 +140,7 @@ async function handleBuild(step: StepCtx): Promise<StepOutcome> {
     await buildImplement({ pi, ctx, change, wtDir });
     if (rt.stopRequested) {
       s.stopReason = "stopped"; rt.interruptedChange = change;
-      ctx.ui.notify(`dev-loop: stopped during build — worktree left; use /loop resume`, "warning");
+      ctx.ui.notify(`dev-loop: stopped during build — worktree left; use /loop resume`, "info");
       persist(); return "stop";
     }
     s.inner = BUILD_INNER.PUSH; persist(); return "cont";
@@ -192,7 +192,7 @@ async function handleReconcile(step: StepCtx): Promise<StepOutcome> {
     case "timeout":
       s.stopReason = "timeout"; rt.interruptedChange = change;
       s.triggerAt = null; s.reviewDeadline = null;
-      ctx.ui.notify(`dev-loop: no Codex review after ${REVIEW_TOTAL_TIMEOUT_MS / 60000}min on round ${s.round}; stopping (PR + worktree left)`, "warning");
+      ctx.ui.notify(`dev-loop: no Codex review after ${REVIEW_TOTAL_TIMEOUT_MS / 60000}min on round ${s.round}; stopping (PR + worktree left)`, "info");
       persist(); return "stop";
     default:
       break;
@@ -234,7 +234,7 @@ async function handleResolveMain(step: StepCtx): Promise<StepOutcome> {
   await resolveMainPhase({ pi, ctx, change, wtDir });
   if (rt.stopRequested) {
     s.stopReason = "stopped"; rt.interruptedChange = change;
-    ctx.ui.notify(`dev-loop: stopped during main-merge resolution — PR + worktree left; use /loop resume`, "warning");
+    ctx.ui.notify(`dev-loop: stopped during main-merge resolution — PR + worktree left; use /loop resume`, "info");
     persist(); return "stop";
   }
   const { stdout: unmerged } = await run(pi, ["git", "diff", "--name-only", "--diff-filter=U"], wtDir);
@@ -286,7 +286,7 @@ async function handleProbe(step: StepCtx): Promise<StepOutcome> {
   if (v.quotaExhausted) {
     s.stopReason = "quota"; rt.interruptedChange = change;
     s.triggerAt = null;
-    ctx.ui.notify(`dev-loop: Codex review quota exhausted — stopping (PR + worktree left); /loop resume after it resets re-triggers @codex review`, "warning");
+    ctx.ui.notify(`dev-loop: Codex review quota exhausted — stopping (PR + worktree left); /loop resume after it resets re-triggers @codex review`, "info");
     persist(); return "stop";
   }
   const sig = suggestionKey(v.suggestions);
@@ -330,7 +330,7 @@ async function handleFix(step: StepCtx): Promise<StepOutcome> {
   await fixPhase({ pi, ctx, change, wtDir }, s);
   if (rt.stopRequested) {
     s.stopReason = "stopped"; rt.interruptedChange = change;
-    ctx.ui.notify(`dev-loop: stopped during fix round ${s.round} — PR + worktree left; use /loop resume`, "warning");
+    ctx.ui.notify(`dev-loop: stopped during fix round ${s.round} — PR + worktree left; use /loop resume`, "info");
     persist(); return "stop";
   }
   const { stdout: headPost } = await run(pi, ["git", "rev-parse", "HEAD"], wtDir);
@@ -529,7 +529,7 @@ export async function runLoopChain(): Promise<void> {
         const ch = rt.runCtx.change;
         const s = readLoopState(ctx.cwd, ch);
         if (s) { s.stopReason = "stopped"; writeLoopState(ctx.cwd, ch, s); }
-        ctx.ui.notify(`dev-loop: stopped (PR + worktree left); use /loop resume`, "warning");
+        ctx.ui.notify(`dev-loop: stopped (PR + worktree left); use /loop resume`, "info");
         endChain(ch, true);
         return;
       }
