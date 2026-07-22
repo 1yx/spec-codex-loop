@@ -80,7 +80,7 @@ pi -e /absolute/path/to/spec-codex-loop/src/dev-loop.ts
 | `/loop --dry-run` | 只在 worktree 中运行实现阶段；不 push、不创建 PR，保留 worktree |
 | `/loop stop` | 请求在下一个安全边界停止，保留 PR、worktree 和持久化状态 |
 | `/loop fetch` | 立即唤醒等待中的 REVIEW 并重新读取 Codex verdict |
-| `/loop resume` | 恢复唯一的 stopped/crashed 持久化状态；存在多个候选时拒绝猜测 |
+| `/loop resume [change]` | 恢复 stopped/crashed 持久化状态；存在多个候选时必须指定 change |
 | `/loop status` | 列出全部持久化 change 的 phase、inner、round、PR 和 stop reason |
 
 等待 REVIEW 时也可从其他终端使用文件信号：
@@ -91,6 +91,28 @@ touch .dev-loop-stop
 ```
 
 `stop` 与 `fetch` 同时出现时，`stop` 优先并消费两个信号。loop 活跃期间，Pi 中的普通交互输入会被忽略，控制操作应使用上述命令或 sentinel 文件。
+
+## Pi Agent Retry
+
+建议在项目根目录的 `.pi/settings.json` 中将 Pi agent-level 自动重试配置为：
+
+```json
+{
+  "retry": {
+    "enabled": true,
+    "maxRetries": 10,
+    "baseDelayMs": 2000,
+    "provider": {
+      "maxRetries": 0,
+      "maxRetryDelayMs": 60000
+    }
+  }
+}
+```
+
+`maxRetries: 10` 配合默认的 2 秒指数退避，会依次等待 2、4、8、16、32、64、128、256、512、1024 秒，累计 2046 秒（约 34 分钟，不含每次 provider 请求本身的耗时）。Pi 在这 10 次重试期间会保持当前 agent turn；只在 `agent_settled` 确认重试全部耗尽后，loop 才将当前 inner state 以 `agent_rate_limited` 落盘并停止。额度恢复后执行 `/loop resume`，会从同一 IMPLEMENT、FIX 或 RESOLVE_MAIN 阶段继续。
+
+保持 `retry.provider.maxRetries` 为 `0`，避免 provider SDK 在 Pi 之外重复等待或长时间吞掉 quota error。Pi 会话仍从项目根目录加载 `.pi/settings.json`；agent 的 shell 命令虽然在 worktree 中执行，但不需要把 `.pi` 复制到 worktree。
 
 ## Lifecycle
 
@@ -146,8 +168,10 @@ stateDiagram-v2
     TRIGGER --> PROBE: nonce + triggerAt + deadline persisted
     PROBE --> RECONCILE: no verdict; suspend and wait
     PROBE --> FIX: suggestions
+    PROBE --> STRATEGY_STOP: churn detected / 5th failed verdict
     FIX --> RECONCILE: new head; round++
     PROBE --> ARCHIVE: pass
+    STRATEGY_STOP --> RECONCILE: user decides to continue; resume
 
     ARCHIVE --> PROBE: main changed approved head
     ARCHIVE --> MERGE: head unchanged
@@ -163,6 +187,23 @@ stateDiagram-v2
 - quota、timeout、Codex error 等已结束的 attempt 会清除 `triggerAt`、`triggerNonce` 和 deadline；`/loop resume` 会为同一 head 创建全新 attempt。
 - 默认每 2 分钟 probe 一次，每轮 review 最长等待 30 分钟；`/loop fetch` 可立即 probe。
 - Codex pass 后，ARCHIVE 仍会 fetch/merge 最新 main。只要 head 改变，就必须回到 REVIEW，不能归档未经评审的新 head。
+
+### Review Circuit Breaker
+
+每次产生 suggestions 的失败 verdict 都会以结构化摘要写入 `reviewHistory`，包括策略周期、round、head、严重度、标题和代码位置。FIX prompt 会附带当前策略周期最近两轮的 finding 摘要，提醒 agent 避免重建相邻问题。
+
+从同一策略周期的第 3 次失败 verdict 起，loop 对最近三轮运行确定性计分。信号包括：
+
+- 三轮集中在同一文件或具体子目录：`+3`。
+- finding 数量连续没有下降：`+2`。
+- 最新两轮涉及相同文件：`+1`。
+- 最新一轮最高严重度高于上一轮：`+3`。
+
+分数达到 `5` 时，loop 在启动 FIX agent turn 之前以 `strategy_required` 停止。无论计分结果如何，同一策略周期的第 5 次失败 verdict 都会以 `review_round_limit` 强制停止，因此每个策略周期最多自动执行 4 次 FIX。完全相同的 suggestion set 仍由原有 `repeat` 检查立即停止。
+
+熔断后，loop 只保存诊断、停止运行并释放仓库锁，不会自行修改 OpenSpec，也不会决定应追加当前 change 还是创建新 change。用户可以直接与 agent 讨论 review 历史和设计方向，再自行选择修改当前 change、另开 change 或放弃。
+
+普通 `/loop <change>` 不会绕过这两种停止。如果用户决定继续当前 change，完成必要的人工或 agent 调整后执行 `/loop resume [change]`。resume 会保留全部历史、递增内部 `strategyEpoch`，并为后续检测建立新的计分窗口；这个 epoch 只是防止旧 verdict 让恢复立即再次熔断，不代表 loop 创建了新的 OpenSpec change。
 
 ## Persistence And Recovery
 
@@ -183,7 +224,7 @@ stateDiagram-v2
 - Pi/Node 进程退出：SQLite 排他事务由 OS 自动释放；遗留 owner/旧 `.reclaim` 文件在下次获取锁时清理。
 - 同一仓库同一时间只允许一个 loop。`.dev-loop.lock.sqlite` 负责跨进程互斥，`.dev-loop.lock` 保存 PID/owner token 用于诊断和旧版本兼容。
 
-`/loop resume` 优先选择带 `stopReason` 的状态；如果没有 stopped state，则允许恢复唯一的 crash state。多个候选存在时不会自动选择。
+`/loop resume` 优先选择带 `stopReason` 的状态；如果没有 stopped state，则允许恢复唯一的 crash state。多个候选存在时不会自动选择，可使用 `/loop resume <change>` 指定。对于 `strategy_required` 和 `review_round_limit`，resume 仅表示用户在讨论和调整后决定继续当前 change；loop 本身不选择后续方案。
 
 ## Git And TODO Semantics
 
@@ -210,6 +251,7 @@ pnpm lint
 - 6 个真实裸远端 Git 场景，包括 fast-forward、divergence、merge conflict 和模糊 push 结果。
 - 18 个外部副作用前/后崩溃边界，以及同进程异常抛出恢复。
 - GitHub 分页、旧 head 隔离、reaction pass 和 trigger attempt 去重。
+- review 历史持久化、同区域往复、严重度升级、无关 finding、五轮硬上限，以及用户决策后的显式恢复。
 - fresh、`--all`、`--dry-run`、one-off、init、status 主流程。
 - 损坏/旧版状态、原子写失败、并发 stale-lock 回收、持锁进程 `SIGKILL`。
 - stop/fetch 优先级、deadline 边界、stale timer 和 agent settlement 竞态。

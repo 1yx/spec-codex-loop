@@ -8,7 +8,8 @@ import type { LoopState } from "./src/runtime.ts";
 const baseState = (phase: string, inner: string | null): LoopState => ({
   phase, inner, round: 1, prNum: 42, head: "aaaaaaa1111111", repo: "owner/repo",
   triggerAt: "2026-07-22T00:00:00Z", reviewDeadline: 123,
-  seenSignatures: [], suggestions: [], stopReason: null, oneOff: true,
+  seenSignatures: [], suggestions: [], reviewHistory: [], strategyEpoch: 0,
+  stopReason: null, stopSummary: null, oneOff: true,
 });
 
 const context = () => {

@@ -59,10 +59,15 @@ export async function buildImplement(p: PhaseCtx): Promise<AgentTurnResult> {
 /** Review→fix agent turn. Reads prNum/round/suggestions from the persisted state. */
 export async function fixPhase(p: PhaseCtx, s: LoopState): Promise<AgentTurnResult> {
   const { pi, ctx, change, wtDir } = p;
+  const prior = s.reviewHistory
+    .filter((entry) => entry.epoch === s.strategyEpoch && entry.round < s.round)
+    .slice(-2)
+    .map((entry) => `- Round ${entry.round}: ${entry.findings.map((finding) => `${finding.severity ?? "n/a"} ${finding.path ?? "general"}: ${finding.title}`).join("; ")}`);
   const prompt = [
     `Codex review (round ${s.round}) on PR #${s.prNum} for change "${change}" raised the comments below.`,
     `Address each one. Work inside the worktree (absolute paths under it; prefix shell`,
     `commands with \`cd ${wtDir} &&\`), run tests, then commit. Do NOT push.`,
+    ...(prior.length > 0 ? ["", "Recent review history (avoid fixes that recreate adjacent failures):", ...prior] : []),
     "",
     formatSuggestions(s.suggestions),
   ].join("\n");

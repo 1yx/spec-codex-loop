@@ -68,10 +68,16 @@ async function initProject(pi: ExtensionAPI, ctx: LoopCtx): Promise<void> {
 function notifyStatusEntry(ctx: LoopCtx, change: string, s: LoopState): void {
   const running = rt.loopActive && rt.runCtx?.change === change;
   const tag = running ? "RUNNING" : s.stopReason ? `STOPPED (${s.stopReason})` : "idle";
-  ctx.ui.notify(
-    `dev-loop: "${change}" — ${tag}\n` +
-    `  phase ${s.phase}${s.inner ? ` / inner ${s.inner}` : ""} · round ${s.round}\n` +
+  const failures = s.reviewHistory.filter((entry) => entry.epoch === s.strategyEpoch).length;
+  const details = [
+    `dev-loop: "${change}" — ${tag}`,
+    `  phase ${s.phase}${s.inner ? ` / inner ${s.inner}` : ""} · round ${s.round}`,
     `  PR #${s.prNum} @ ${shortSha(s.head)} (${s.repo})`,
+    `  review failures ${failures} in strategy epoch ${s.strategyEpoch}`,
+    ...(s.stopSummary ? [`  ${s.stopSummary}`] : []),
+  ].join("\n");
+  ctx.ui.notify(
+    details,
     running ? "info" : s.stopReason ? "warning" : "info",
   );
 }
@@ -121,35 +127,43 @@ function beginRun(ctx: LoopCtx, runCtx: NonNullable<typeof rt.runCtx>): boolean 
 /**
  * `/loop resume`: re-enter the change last stopped via `/loop stop`.
  */
-async function handleResume(pi: ExtensionAPI, ctx: LoopCtx): Promise<void> {
-  let ch = rt.interruptedChange;
-  if (!ch) {
-    // Prefer explicit stopped states. If none exist, a unique persisted state
-    // is a crash-recovery candidate (the process may have died before writing a stopReason).
-    const found = scanLoopStates(ctx.cwd);
-    const stopped = found.filter((x) => x.s.stopReason);
-    const candidates = stopped.length > 0 ? stopped : found;
-    if (candidates.length === 0) {
-      ctx.ui.notify("dev-loop: nothing to resume (no persisted loop state)", "info");
-      return;
-    }
-    if (candidates.length > 1) {
-      ctx.ui.notify(`dev-loop: multiple resumable changes (${candidates.map((x) => x.change).join(", ")}); specify one with /loop <change>`, "info");
-      return;
-    }
-    ch = candidates[0].change;
-    ctx.ui.notify(`dev-loop: interruptedChange lost on restart — resuming "${ch}" from disk state`, "info");
-  }
+async function handleResume(pi: ExtensionAPI, ctx: LoopCtx, requestedChange?: string): Promise<void> {
+  const ch = resumeChange(ctx, requestedChange);
+  if (!ch) {return;}
   if (!(await checkPreconditions(pi, ctx))) {return;}
   await ensureLocalIgnore(pi, ctx.cwd, `${LOOP_LOCK_FILE}*`);
   ctx.ui.notify(`dev-loop: resuming "${ch}"`, "info");
-  const runCtx = { ctx, change: ch, dryRun: false, all: false, oneOff: true };
+  const runCtx = { ctx, change: ch, dryRun: false, all: false, oneOff: true, resumeStopped: true };
   if (!beginRun(ctx, runCtx)) {return;}
   // Clear stale sentinels left by a touch while no loop was running.
   for (const s of [FETCH_SENTINEL, STOP_SENTINEL]) {
     try { unlinkSync(join(ctx.cwd, s)); } catch { /* already gone */ }
   }
   await runLoopChain();
+}
+
+/** Select the sole resumable change, preferring explicitly stopped states. */
+function resumeChange(ctx: LoopCtx, requested?: string): string | null {
+  if (requested) {
+    if (readLoopState(ctx.cwd, requested)) {return requested;}
+    ctx.ui.notify(`dev-loop: no persisted loop state for "${requested}"`, "info");
+    return null;
+  }
+  if (rt.interruptedChange) {return rt.interruptedChange;}
+  const found = scanLoopStates(ctx.cwd);
+  const stopped = found.filter((entry) => entry.s.stopReason);
+  const candidates = stopped.length > 0 ? stopped : found;
+  if (candidates.length === 0) {
+    ctx.ui.notify("dev-loop: nothing to resume (no persisted loop state)", "info");
+    return null;
+  }
+  if (candidates.length > 1) {
+    ctx.ui.notify(`dev-loop: multiple resumable changes (${candidates.map((entry) => entry.change).join(", ")}); specify one with /loop resume <change>`, "info");
+    return null;
+  }
+  const change = candidates[0].change;
+  ctx.ui.notify(`dev-loop: interruptedChange lost on restart — resuming "${change}" from disk state`, "info");
+  return change;
 }
 
 /** Normal run: /loop [change] [--dry-run] [--all]. */
@@ -176,7 +190,7 @@ async function handleNormalRun(pi: ExtensionAPI, ctx: LoopCtx, tokens: string[])
     }
     firstChange = t.text;
   }
-  const runCtx = { ctx, change: firstChange, dryRun, all, oneOff: !!oneOff };
+  const runCtx = { ctx, change: firstChange, dryRun, all, oneOff: !!oneOff, resumeStopped: false };
   if (!beginRun(ctx, runCtx)) {return;}
   await runLoopChain();
 }
@@ -191,7 +205,10 @@ async function loopCommandHandler(pi: ExtensionAPI, args: unknown, ctx: LoopCtx)
   if (sub === "stop") {return writeControl(ctx, STOP_SENTINEL, "stop");}
   if (sub === "fetch") {return writeControl(ctx, FETCH_SENTINEL, "fetch");}
   if (sub === "status") {return handleStatus(ctx);}
-  if (sub === "resume") {return handleResume(pi, ctx);}
+  if (sub === "resume") {
+    const requested = tokens.slice(1).find((token) => !token.startsWith("--"));
+    return handleResume(pi, ctx, requested);
+  }
   return handleNormalRun(pi, ctx, tokens);
 }
 
@@ -234,7 +251,7 @@ export default function (pi: ExtensionAPI): void {
 
   pi.registerCommand("loop", {
     description:
-      "Autonomous OpenSpec-change → worktree → PR → Codex review → archive → merge loop. Subcommands: stop | fetch | resume | status. Flags: --dry-run --all",
+      "Autonomous OpenSpec-change → worktree → PR → Codex review → archive → merge loop. Subcommands: stop | fetch | resume [change] | status. Flags: --dry-run --all",
     handler: (args: unknown, ctx: LoopCtx) => loopCommandHandler(pi, args, ctx),
   });
 }

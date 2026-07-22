@@ -25,7 +25,8 @@ const baseState = (): LoopState => ({
   phase: "review", inner: "review_probe", round: 1, prNum: 42,
   head: "abcdef1234567890", repo: "owner/repo", triggerAt: null,
   reviewDeadline: null, seenSignatures: [], suggestions: [], agentHead: null,
-  stopReason: "stopped", oneOff: true,
+  reviewHistory: [], strategyEpoch: 0,
+  stopReason: "stopped", stopSummary: null, oneOff: true,
 });
 
 function withRoot(run: (root: string, change: string) => void): void {
@@ -47,7 +48,7 @@ withRoot((root, change) => {
 withRoot((root, change) => {
   writeFileSync(statePath(root, change), JSON.stringify({ phase: "review", stopReason: "stopped" }));
   const state = readLoopState(root, change);
-  check("fills fields omitted by legacy REVIEW state", state?.inner === "review_reconcile" && state.round === 0 && state.suggestions.length === 0 && !state.oneOff);
+  check("fills fields omitted by legacy REVIEW state", state?.inner === "review_reconcile" && state.round === 0 && state.suggestions.length === 0 && state.reviewHistory.length === 0 && state.strategyEpoch === 0 && !state.oneOff);
 });
 
 withRoot((root, change) => {
@@ -60,9 +61,13 @@ withRoot((root, change) => {
     ...baseState(),
     suggestions: [{ severity: "P1", title: "valid", body: "fix", path: "src/a.ts", line: 1 }, { title: 7 }],
     seenSignatures: ["ok", 4],
+    reviewHistory: [
+      { epoch: 0, round: 1, head: "abc", findings: [{ severity: "P2", title: "valid", path: "src/a.ts", line: 1 }] },
+      { epoch: "bad", findings: [] },
+    ],
   }));
   const state = readLoopState(root, change);
-  check("filters malformed nested persisted values", state?.suggestions.length === 1 && state.seenSignatures.length === 1);
+  check("filters malformed nested persisted values", state?.suggestions.length === 1 && state.seenSignatures.length === 1 && state.reviewHistory.length === 1);
 });
 
 console.log("atomic state persistence:");

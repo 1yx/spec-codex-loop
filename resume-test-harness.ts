@@ -86,7 +86,8 @@ export class ResumeHarness {
     return {
       phase: "review", inner: "review_probe", round: 1, prNum: this.prNum,
       head: this.head, repo: "owner/repo", triggerAt: null, reviewDeadline: null,
-      seenSignatures: [], suggestions: [], stopReason: "test_stop", oneOff: true,
+      seenSignatures: [], suggestions: [], reviewHistory: [], strategyEpoch: 0,
+      stopReason: "test_stop", stopSummary: null, oneOff: true,
       ...overrides,
     };
   }

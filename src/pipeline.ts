@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { BUILD_INNER, PHASE, REVIEW_INNER } from "./lifecycle-state.ts";
 import { stopForAgentFailure } from "./agent-turn.ts";
 import { normalizeResumeState } from "./resume-state.ts";
+import { evaluateReviewCircuit, isStrategyStopReason, reviewHistoryEntry } from "./review-circuit-breaker.ts";
 import {
   FETCH_SENTINEL,
   LOOP_LOCK_FILE,
@@ -19,6 +20,7 @@ import {
   type LoopState,
   type PhaseCtx,
   type StepCtx,
+  type Suggestion,
 } from "./runtime.ts";
 import {
   copyEnvFiles,
@@ -302,14 +304,31 @@ async function handleProbe(step: StepCtx): Promise<StepOutcome> {
     ctx.ui.notify(`dev-loop: Codex passed on round ${s.round}`, "info");
     s.phase = PHASE.ARCHIVE; s.inner = null; persist(); return "cont";
   }
-  const sig = suggestionKey(v.suggestions);
+  return handleFailedVerdict(step, v.suggestions);
+}
+
+/** Persist a failed verdict and stop before FIX when repeat/churn guards trip. */
+function handleFailedVerdict(step: StepCtx, suggestions: Suggestion[]): StepOutcome {
+  const { ctx, change, s, persist } = step;
+  const sig = suggestionKey(suggestions);
   if (s.seenSignatures.includes(sig)) {
     s.stopReason = "repeat"; rt.interruptedChange = change; resetReviewAttempt(s);
     ctx.ui.notify(`dev-loop: round ${s.round} repeats a prior review (fixes not landing); stopping (PR + worktree left)`, "warning");
     persist(); return "stop";
   }
+  s.reviewHistory.push(reviewHistoryEntry(s, suggestions));
+  const circuit = evaluateReviewCircuit(s.reviewHistory, s.strategyEpoch);
+  if (circuit.stopReason) {
+    s.stopReason = circuit.stopReason; s.stopSummary = circuit.summary;
+    rt.interruptedChange = change; resetReviewAttempt(s);
+    ctx.ui.notify(
+      `dev-loop: ${circuit.summary}; stopping before FIX — discuss the strategy with the agent before deciding whether to continue this change`,
+      "warning",
+    );
+    persist(); return "stop";
+  }
   s.seenSignatures.push(sig);
-  s.suggestions = v.suggestions;
+  s.suggestions = suggestions;
   s.inner = REVIEW_INNER.FIX; persist(); return "cont";
 }
 
@@ -370,6 +389,8 @@ async function handleFix(step: StepCtx): Promise<StepOutcome> {
     persist(); return "stop";
   }
   s.agentHead = null;
+  const latestHistory = s.reviewHistory.findLast((entry) => entry.epoch === s.strategyEpoch && entry.round === s.round);
+  if (latestHistory) {latestHistory.fixHead = headPost;}
   s.round++;
   resetReviewAttempt(s);
   s.inner = REVIEW_INNER.RECONCILE; persist(); return "cont";
@@ -510,8 +531,9 @@ type InitState = { s: LoopState } | "completed" | "aborted";
  * Map an atReview/atBuild PrefixResult to the initial BUILD/REVIEW LoopState (null for terminal kinds).
  */
 function seedFromPrefix(r: PrefixResult, oneOff: boolean): LoopState | null {
-  if (r.kind === "atReview") {return { phase: PHASE.REVIEW, inner: REVIEW_INNER.RECONCILE, round: 1, prNum: r.prNum, head: r.head, repo: r.repo, triggerAt: null, reviewDeadline: null, seenSignatures: [], suggestions: [], stopReason: null, oneOff };}
-  if (r.kind === "atBuild") {return { phase: PHASE.BUILD, inner: BUILD_INNER.IMPLEMENT, round: 0, prNum: 0, head: "", repo: r.repo, triggerAt: null, reviewDeadline: null, seenSignatures: [], suggestions: [], stopReason: null, oneOff };}
+  const history = { reviewHistory: [], strategyEpoch: 0, stopSummary: null };
+  if (r.kind === "atReview") {return { phase: PHASE.REVIEW, inner: REVIEW_INNER.RECONCILE, round: 1, prNum: r.prNum, head: r.head, repo: r.repo, triggerAt: null, reviewDeadline: null, seenSignatures: [], suggestions: [], stopReason: null, oneOff, ...history };}
+  if (r.kind === "atBuild") {return { phase: PHASE.BUILD, inner: BUILD_INNER.IMPLEMENT, round: 0, prNum: 0, head: "", repo: r.repo, triggerAt: null, reviewDeadline: null, seenSignatures: [], suggestions: [], stopReason: null, oneOff, ...history };}
   return null;
 }
 
@@ -531,7 +553,7 @@ async function rederiveState(pi: ExtensionAPI, ctx: LoopCtx, change: string): Pr
 async function resolveInitialState(pi: ExtensionAPI, ctx: LoopCtx, change: string): Promise<InitState> {
   const s = readLoopState(ctx.cwd, change);
   if (s && s.phase !== PHASE.RESOLVE && s.phase !== PHASE.PROVISION) {
-    if (normalizeResumeState(s)) {writeLoopState(ctx.cwd, change, s);}
+    if (normalizeResumeState(s, rt.runCtx?.resumeStopped ?? false)) {writeLoopState(ctx.cwd, change, s);}
     return { s };
   }
   return rederiveState(pi, ctx, change);
@@ -542,6 +564,10 @@ export async function driveChange(pi: ExtensionAPI, ctx: LoopCtx, change: string
   const init = await resolveInitialState(pi, ctx, change);
   if (init === "completed" || init === "aborted") {return init;}
   const s = init.s;
+  if (isStrategyStopReason(s.stopReason)) {
+    ctx.ui.notify(`dev-loop: "${change}" requires a strategy decision (${s.stopSummary ?? s.stopReason}); discuss it with the agent, then use /loop resume only if continuing this change`, "warning");
+    return "stopped";
+  }
   const repoRoot = ctx.cwd;
   const wtDir = join(repoRoot, WORKTREE_ROOT, change);
   const persist = () => writeLoopState(repoRoot, change, s);

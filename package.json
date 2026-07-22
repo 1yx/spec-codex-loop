@@ -13,7 +13,7 @@
     ]
   },
   "scripts": {
-    "test": "node lifecycle-state.test.ts && node loop-wait.test.ts && node pipeline-recovery.test.ts && node loop-resume-phases.test.ts && node loop-resume-failures.test.ts && node real-git-recovery.test.ts && node crash-recovery.test.ts && node codex-boundaries.test.ts && node main-flow.test.ts && node persistence-recovery.test.ts && node control-time-races.test.ts",
+    "test": "node lifecycle-state.test.ts && node loop-wait.test.ts && node pipeline-recovery.test.ts && node review-circuit-breaker.test.ts && node loop-resume-phases.test.ts && node loop-resume-failures.test.ts && node real-git-recovery.test.ts && node crash-recovery.test.ts && node codex-boundaries.test.ts && node main-flow.test.ts && node persistence-recovery.test.ts && node control-time-races.test.ts",
     "typecheck": "tsc --noEmit",
     "lint": "eslint src *.ts"
   },

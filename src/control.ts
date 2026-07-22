@@ -13,6 +13,7 @@ import {
   rt,
   type LoopCtx,
   type LoopState,
+  type ReviewHistoryEntry,
   type Suggestion,
 } from "./runtime.ts";
 
@@ -78,8 +79,11 @@ function normalizeLoopState(value: unknown): LoopState | null {
     reviewDeadline: nullableNumber(raw.reviewDeadline),
     seenSignatures: stringArray(raw.seenSignatures),
     suggestions: suggestionArray(raw.suggestions),
+    reviewHistory: reviewHistoryArray(raw.reviewHistory),
+    strategyEpoch: numberOr(raw.strategyEpoch, 0),
     agentHead: nullableString(raw.agentHead, null),
     stopReason: nullableString(raw.stopReason, null),
+    stopSummary: nullableString(raw.stopSummary, null),
     oneOff: typeof raw.oneOff === "boolean" && raw.oneOff,
   };
 }
@@ -114,6 +118,43 @@ const nullableString = (value: unknown, fallback: string | null): string | null 
 const nullableNumber = (value: unknown): number | null => typeof value === "number" ? value : null;
 const stringArray = (value: unknown): string[] => Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
 const suggestionArray = (value: unknown): Suggestion[] => Array.isArray(value) ? value.filter(isSuggestion) : [];
+const reviewHistoryArray = (value: unknown): ReviewHistoryEntry[] => {
+  if (!Array.isArray(value)) {return [];}
+  return value.flatMap((item): ReviewHistoryEntry[] => {
+    if (!item || typeof item !== "object") {return [];}
+    const raw: Record<string, unknown> = Object.fromEntries(Object.entries(item));
+    if (typeof raw.epoch !== "number" || typeof raw.round !== "number" || typeof raw.head !== "string") {return [];}
+    const findings = suggestionSummaryArray(raw.findings);
+    if (!Array.isArray(raw.findings) || findings.length !== raw.findings.length) {return [];}
+    return [{
+      epoch: raw.epoch,
+      round: raw.round,
+      head: raw.head,
+      findings,
+      fixHead: nullableString(raw.fixHead, null),
+    }];
+  });
+};
+
+/** Validate compact findings nested in persisted review history. */
+function suggestionSummaryArray(value: unknown): ReviewHistoryEntry["findings"] {
+  if (!Array.isArray(value)) {return [];}
+  return value.flatMap((item): ReviewHistoryEntry["findings"] => {
+    if (!item || typeof item !== "object") {return [];}
+    const raw: Record<string, unknown> = Object.fromEntries(Object.entries(item));
+    const { severity, title, path, line } = raw;
+    if ((severity !== null && typeof severity !== "string")
+      || typeof title !== "string"
+      || (path !== null && typeof path !== "string")
+      || (line !== null && typeof line !== "number")) {return [];}
+    return [{
+      severity,
+      title,
+      path,
+      line,
+    }];
+  });
+}
 /**
  * Persist a change's loop state (atomic temp-file rename).
  */

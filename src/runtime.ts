@@ -9,6 +9,7 @@ export const WORKTREE_ROOT = ".worktree";
 export const POLL_TICK_MS = 1000;
 export const REVIEW_WAIT_MS = 2 * 60_000; // poll interval between Codex fetches
 export const REVIEW_TOTAL_TIMEOUT_MS = 30 * 60_000; // cap per round
+export const REVIEW_FAILURE_LIMIT = 5;
 
 // --- cross-cutting types ------------------------------------------------------
 /**
@@ -20,6 +21,15 @@ export type Suggestion = {
   body: string;
   path: string | null;
   line: number | null;
+}
+
+/** Compact, persisted record of one failed Codex verdict. */
+export type ReviewHistoryEntry = {
+  epoch: number;
+  round: number;
+  head: string;
+  findings: Array<Pick<Suggestion, "severity" | "title" | "path" | "line">>;
+  fixHead?: string | null;
 }
 
 /**
@@ -56,10 +66,15 @@ export type LoopState = {
   reviewDeadline: number | null;
   seenSignatures: string[];
   suggestions: Suggestion[];
+  /** Failed verdicts retained across retries and forced strategy restarts. */
+  reviewHistory: ReviewHistoryEntry[];
+  /** Incremented only by an explicit strategy-force resume. */
+  strategyEpoch: number;
   /** HEAD before the current FIX agent turn. Retained across provider failures
    * so a commit made before a terminal 429 still counts as progress on resume. */
   agentHead?: string | null;
   stopReason: string | null;
+  stopSummary: string | null;
   oneOff: boolean;
 }
 
@@ -90,6 +105,8 @@ export type RunCtx = {
   dryRun: boolean;
   all: boolean;
   oneOff: boolean;
+  /** True only for the explicit /loop resume command. */
+  resumeStopped?: boolean;
 };
 
 /** The slice of pi's ExtensionContext the loop actually uses (the full type lives
