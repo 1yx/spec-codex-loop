@@ -50,7 +50,7 @@ export function readLoopState(repoRoot: string, change: string): LoopState | nul
     const p = statePath(repoRoot, change);
     if (!existsSync(p)) {return null;}
     const parsed = JSON.parse(readFileSync(p, "utf-8")) as LoopState;
-    // suggestions are never persisted (writeLoopState omits them) — default to [].
+    // Older state files did not persist suggestions; default to [] for compatibility.
     return { ...parsed, suggestions: parsed.suggestions ?? [] };
   } catch { return null; }
 }
@@ -60,9 +60,10 @@ export function readLoopState(repoRoot: string, change: string): LoopState | nul
 export function writeLoopState(repoRoot: string, change: string, s: LoopState): void {
   const p = statePath(repoRoot, change);
   const tmp = `${p}.tmp`;
-  // suggestions are an ephemeral per-head Codex verdict — omit on persist so a
-  //  resume always re-probes GitHub instead of trusting a stale list.
-  try { writeFileSync(tmp, JSON.stringify(s, (k, v) => k === "suggestions" ? undefined : v)); renameSync(tmp, p); } catch { /* resume re-derives */ }
+  // Suggestions are required to resume an interrupted FIX agent turn. Outside
+  // FIX they are ephemeral and omitted so later states cannot reuse a stale verdict.
+  const persisted = s.phase === "review" && s.inner === "review_fix" ? s : { ...s, suggestions: undefined };
+  try { writeFileSync(tmp, JSON.stringify(persisted)); renameSync(tmp, p); } catch { /* resume re-derives */ }
 }
 /**
  * Delete a change's persisted loop state (after a clean merge).

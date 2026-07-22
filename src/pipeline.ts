@@ -2,6 +2,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { cpSync, existsSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import { BUILD_INNER, PHASE, REVIEW_INNER } from "./lifecycle-state.ts";
+import { stopForAgentFailure } from "./agent-turn.ts";
 import {
   FETCH_SENTINEL,
   LOOP_STATE_FILE,
@@ -137,12 +138,13 @@ export async function runPrefix(pi: ExtensionAPI, ctx: LoopCtx, change: string):
 async function handleBuild(step: StepCtx): Promise<StepOutcome> {
   const { pi, ctx, change, s, wtDir, persist } = step;
   if (s.inner === BUILD_INNER.IMPLEMENT) {
-    await buildImplement({ pi, ctx, change, wtDir });
+    const turn = await buildImplement({ pi, ctx, change, wtDir });
     if (rt.stopRequested) {
       s.stopReason = "stopped"; rt.interruptedChange = change;
       ctx.ui.notify(`dev-loop: stopped during build — worktree left; use /loop resume`, "info");
       persist(); return "stop";
     }
+    if (!turn.ok) {return stopForAgentFailure(step, turn.error);}
     s.inner = BUILD_INNER.PUSH; persist(); return "cont";
   }
   if (s.inner === BUILD_INNER.PUSH) {
@@ -231,12 +233,13 @@ async function handleReconcile(step: StepCtx): Promise<StepOutcome> {
  */
 async function handleResolveMain(step: StepCtx): Promise<StepOutcome> {
   const { pi, ctx, change, s, wtDir, persist } = step;
-  await resolveMainPhase({ pi, ctx, change, wtDir });
+  const turn = await resolveMainPhase({ pi, ctx, change, wtDir });
   if (rt.stopRequested) {
     s.stopReason = "stopped"; rt.interruptedChange = change;
     ctx.ui.notify(`dev-loop: stopped during main-merge resolution — PR + worktree left; use /loop resume`, "info");
     persist(); return "stop";
   }
+  if (!turn.ok) {return stopForAgentFailure(step, turn.error);}
   const { stdout: unmerged } = await run(pi, ["git", "diff", "--name-only", "--diff-filter=U"], wtDir);
   if (unmerged) {
     s.stopReason = "main_conflict_unresolved"; rt.interruptedChange = change;
@@ -275,23 +278,23 @@ async function handleProbe(step: StepCtx): Promise<StepOutcome> {
   }
   if (v.unclassified) {
     s.stopReason = "codex_error"; rt.interruptedChange = change;
-    s.triggerAt = null;
+    s.triggerAt = null; s.reviewDeadline = null;
     ctx.ui.notify(`dev-loop: Codex replied with an unrecognized comment on round ${s.round} (likely an error); stopping — /loop resume re-triggers @codex review`, "warning");
     persist(); return "stop";
   }
-  if (v.pass || v.suggestions.length === 0) {
-    ctx.ui.notify(`dev-loop: Codex passed on round ${s.round}`, "info");
-    s.phase = PHASE.ARCHIVE; s.inner = null; persist(); return "cont";
-  }
   if (v.quotaExhausted) {
     s.stopReason = "quota"; rt.interruptedChange = change;
-    s.triggerAt = null;
+    s.triggerAt = null; s.reviewDeadline = null;
     ctx.ui.notify(`dev-loop: Codex review quota exhausted — stopping (PR + worktree left); /loop resume after it resets re-triggers @codex review`, "info");
     persist(); return "stop";
   }
+  if (v.pass) {
+    ctx.ui.notify(`dev-loop: Codex passed on round ${s.round}`, "info");
+    s.phase = PHASE.ARCHIVE; s.inner = null; persist(); return "cont";
+  }
   const sig = suggestionKey(v.suggestions);
   if (s.seenSignatures.includes(sig)) {
-    s.stopReason = "repeat"; rt.interruptedChange = change;
+    s.stopReason = "repeat"; rt.interruptedChange = change; s.triggerAt = null; s.reviewDeadline = null;
     ctx.ui.notify(`dev-loop: round ${s.round} repeats a prior review (fixes not landing); stopping (PR + worktree left)`, "warning");
     persist(); return "stop";
   }
@@ -314,7 +317,7 @@ async function handleTrigger(step: StepCtx): Promise<StepOutcome> {
   // latestCommentAt can return "" right after the post (GitHub eventual
   //  consistency on the issues/comments index, or an empty result). Fall back
   //  to local time so !s.triggerAt can never re-fire @codex review each cycle.
-  s.triggerAt = (await latestCommentAt(pi, s.repo, s.prNum)) || new Date().toISOString();
+  s.triggerAt = (await latestCommentAt(pi, s.repo, s.prNum)) || Temporal.Now.instant().toString();
   s.reviewDeadline = Temporal.Now.instant().epochMilliseconds + REVIEW_TOTAL_TIMEOUT_MS;
   s.inner = REVIEW_INNER.PROBE;
   ctx.ui.notify(`dev-loop: round ${s.round} on ${shortSha(s.head)} — triggered @codex review, polling every ${REVIEW_WAIT_MS / 60000}min (≤${REVIEW_TOTAL_TIMEOUT_MS / 60000}min; touch ${FETCH_SENTINEL} to recheck)…`, "info");
@@ -326,15 +329,20 @@ async function handleTrigger(step: StepCtx): Promise<StepOutcome> {
  */
 async function handleFix(step: StepCtx): Promise<StepOutcome> {
   const { pi, ctx, change, s, wtDir, persist } = step;
-  const { stdout: headPre } = await run(pi, ["git", "rev-parse", "HEAD"], wtDir);
-  await fixPhase({ pi, ctx, change, wtDir }, s);
+  if (!s.agentHead) {
+    const { stdout } = await run(pi, ["git", "rev-parse", "HEAD"], wtDir);
+    s.agentHead = stdout;
+    persist();
+  }
+  const turn = await fixPhase({ pi, ctx, change, wtDir }, s);
   if (rt.stopRequested) {
     s.stopReason = "stopped"; rt.interruptedChange = change;
     ctx.ui.notify(`dev-loop: stopped during fix round ${s.round} — PR + worktree left; use /loop resume`, "info");
     persist(); return "stop";
   }
+  if (!turn.ok) {return stopForAgentFailure(step, turn.error);}
   const { stdout: headPost } = await run(pi, ["git", "rev-parse", "HEAD"], wtDir);
-  if (headPre === headPost) {
+  if (s.agentHead === headPost) {
     s.stopReason = "no_progress"; rt.interruptedChange = change;
     ctx.ui.notify(`dev-loop: agent made no progress on round ${s.round}; stopping (PR + worktree left)`, "warning");
     persist(); return "stop";
@@ -345,8 +353,10 @@ async function handleFix(step: StepCtx): Promise<StepOutcome> {
     ctx.ui.notify(`dev-loop: git push failed on round ${s.round} (${pushErr}); stopping — fix then /loop resume`, "error");
     persist(); return "stop";
   }
+  s.agentHead = null;
   s.round++;
-  s.reviewDeadline = Temporal.Now.instant().epochMilliseconds + REVIEW_TOTAL_TIMEOUT_MS;
+  s.triggerAt = null;
+  s.reviewDeadline = null;
   s.inner = REVIEW_INNER.RECONCILE; persist(); return "cont";
 }
 
@@ -365,16 +375,15 @@ async function handleReview(step: StepCtx): Promise<StepOutcome> {
   }
 }
 
-/**
- * ARCHIVE: openspec archive + mark TODO [x] + commit + push.
- */
-async function handleArchive(step: StepCtx): Promise<StepOutcome> {
+/** Bring latest main into an approved head, requiring a new review if HEAD changes. */
+async function reconcileMainBeforeArchive(step: StepCtx): Promise<StepOutcome | null> {
   const { pi, ctx, change, s, wtDir, persist } = step;
-  // Reconcile main before archiving: PROBE→ARCHIVE skips RECONCILE, so if
-  //  origin/main advanced after the last reconcile (e.g. another PR merged),
-  //  archive against the latest main or the delta sync + archive/ path diverge
-  //  from main (the #25/#26 spec clash). Conflict -> stop for resolution.
-  await run(pi, ["git", "fetch", "origin", "main"], wtDir);
+  const { code: fetchCode, stderr: fetchErr } = await run(pi, ["git", "fetch", "origin", "main"], wtDir);
+  if (fetchCode !== 0) {
+    s.stopReason = "archive_fetch_failed"; rt.interruptedChange = change;
+    ctx.ui.notify(`dev-loop: fetch of origin/main before archive failed (${fetchErr}); stopping — /loop resume retries from archive`, "error");
+    persist(); return "stop";
+  }
   const { code: mc } = await run(pi, ["git", "merge", "origin/main", "--no-edit"], wtDir);
   if (mc !== 0) {
     await run(pi, ["git", "merge", "--abort"], wtDir);
@@ -382,12 +391,33 @@ async function handleArchive(step: StepCtx): Promise<StepOutcome> {
     ctx.ui.notify(`dev-loop: origin/main conflicts before archive (round ${s.round}); stopping — resolve then /loop resume`, "warning");
     persist(); return "stop";
   }
-  const { code: rpc, stderr: rpe } = await run(pi, ["git", "push"], wtDir);
-  if (rpc !== 0) {
-    s.stopReason = "archive_push_failed"; rt.interruptedChange = change;
-    ctx.ui.notify(`dev-loop: push of main-reconcile before archive failed (${rpe}); stopping — fix then /loop resume`, "error");
-    persist(); return "stop";
+  const { stdout: headAfterMerge } = await run(pi, ["git", "rev-parse", "HEAD"], wtDir);
+  // Compare with the persisted approved head, not this invocation's pre-merge
+  // head. A prior attempt may have merged main and then failed to push.
+  if (headAfterMerge !== s.head) {
+    const { code: rpc, stderr: rpe } = await run(pi, ["git", "push"], wtDir);
+    if (rpc !== 0) {
+      s.stopReason = "archive_push_failed"; rt.interruptedChange = change;
+      ctx.ui.notify(`dev-loop: push of main-reconcile before archive failed (${rpe}); stopping — fix then /loop resume`, "error");
+      persist(); return "stop";
+    }
+    s.phase = PHASE.REVIEW; s.inner = REVIEW_INNER.PROBE; s.head = headAfterMerge;
+    s.triggerAt = null; s.reviewDeadline = null; s.suggestions = [];
+    ctx.ui.notify(`dev-loop: origin/main changed the approved head to ${shortSha(s.head)}; returning to Codex review before archive`, "info");
+    persist(); return "cont";
   }
+  return null;
+}
+
+/**
+ * ARCHIVE: openspec archive + mark TODO [x] + commit + push.
+ */
+async function handleArchive(step: StepCtx): Promise<StepOutcome> {
+  const { pi, ctx, change, s, wtDir, persist } = step;
+  // PROBE→ARCHIVE skips RECONCILE. Verify latest main here, and if merging it
+  // changes HEAD, send that new commit through Codex before archiving.
+  const reconcileOutcome = await reconcileMainBeforeArchive(step);
+  if (reconcileOutcome) {return reconcileOutcome;}
   const wtChangeDir = join(wtDir, "openspec", "changes", change);
   if (existsSync(wtChangeDir)) {
     const { code, stderr } = await run(pi, ["openspec", "archive", change, "-y"], wtDir);
@@ -473,19 +503,30 @@ async function rederiveState(pi: ExtensionAPI, ctx: LoopCtx, change: string): Pr
   return s ? { s } : "aborted";
 }
 
-/** Read persisted state; if absent or at RESOLVE/PROVISION, re-derive via runPrefix. */
+/** Normalize persisted stop/legacy state into a safe re-entry point. */
+function normalizeResumeState(s: LoopState): boolean {
+  let changed = false;
+  // A stopped PROBE may have been repaired manually with a new pushed HEAD.
+  // Reconcile first and discard the old review trigger before probing again.
+  if (s.stopReason && s.phase === PHASE.REVIEW && s.inner === REVIEW_INNER.PROBE) {
+    s.inner = REVIEW_INNER.RECONCILE; s.triggerAt = null; s.reviewDeadline = null;
+    changed = true;
+  }
+  // Legacy FIX states omitted suggestions; re-probe without tripping repeat.
+  if (s.phase === PHASE.REVIEW && s.inner === REVIEW_INNER.FIX && s.suggestions.length === 0) {
+    s.inner = REVIEW_INNER.RECONCILE;
+    s.seenSignatures.pop();
+    changed = true;
+  }
+  if (s.stopReason) {s.stopReason = null; changed = true;}
+  return changed;
+}
+
+/** Read persisted state; normalize stopped re-entry points before driving. */
 async function resolveInitialState(pi: ExtensionAPI, ctx: LoopCtx, change: string): Promise<InitState> {
   const s = readLoopState(ctx.cwd, change);
   if (s && s.phase !== PHASE.RESOLVE && s.phase !== PHASE.PROVISION) {
-    // driveChange calls this on EVERY wake (not just resume), so never clear
-    //  triggerAt/deadline here — that would re-fire @codex review every 2min.
-    //  Only fix the one unsafe resume target: FIX needs suggestions, which
-    //  aren't persisted, so resuming into FIX would no_progress on [] — drop it
-    //  back to RECONCILE to re-probe. triggerAt/deadline carry across wakes.
-    if (s.phase === PHASE.REVIEW && s.inner === REVIEW_INNER.FIX) {
-      s.inner = REVIEW_INNER.RECONCILE;
-      writeLoopState(ctx.cwd, change, s);
-    }
+    if (normalizeResumeState(s)) {writeLoopState(ctx.cwd, change, s);}
     return { s };
   }
   return rederiveState(pi, ctx, change);

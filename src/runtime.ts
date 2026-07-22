@@ -52,8 +52,18 @@ export type LoopState = {
   reviewDeadline: number | null;
   seenSignatures: string[];
   suggestions: Suggestion[];
+  /** HEAD before the current FIX agent turn. Retained across provider failures
+   * so a commit made before a terminal 429 still counts as progress on resume. */
+  agentHead?: string | null;
   stopReason: string | null;
   oneOff: boolean;
+}
+
+/** Final outcome of an agent-driven phase after Pi has exhausted its own
+ * automatic retries. */
+export type AgentTurnResult = {
+  ok: boolean;
+  error: string | null;
 }
 
 /**
@@ -115,7 +125,8 @@ type RtState = {
   fetchRequested: boolean;
   waitTimers: Map<string, NodeJS.Timeout>;
   sentinelTicker: NodeJS.Timeout | null;
-  turnResolve: (() => void) | null;
+  turnResolve: ((result: AgentTurnResult) => void) | null;
+  turnResult: AgentTurnResult | null;
   /** Loop wake callback (set by the entry; control/timer trigger it without
    *  importing the pipeline, avoiding a control↔pipeline import cycle). */
   wakeLoop: (() => void | Promise<void>) | null;
@@ -132,6 +143,7 @@ export const rt: RtState = {
   waitTimers: new Map(),
   sentinelTicker: null,
   turnResolve: null,
+  turnResult: null,
   wakeLoop: null,
 };
 

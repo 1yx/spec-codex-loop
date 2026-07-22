@@ -1,34 +1,40 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { POLL_TICK_MS, rt, type LoopCtx, type LoopState, type PhaseCtx } from "./runtime.ts";
+import { POLL_TICK_MS, rt, type AgentTurnResult, type LoopCtx, type LoopState, type PhaseCtx } from "./runtime.ts";
 import { run } from "./git-utils.ts";
 import { formatSuggestions } from "./codex.ts";
 
-/** Send a user message and resolve on the next agent_end (one shared listener,
- *  no accumulation). Also resolves early if /loop stop fires mid-turn — the
+/** Send a user message and resolve once the agent is fully settled (including
+ *  Pi's automatic retries). Also resolves early if /loop stop fires mid-turn — the
  *  in-flight agent turn runs to its own end, but the loop exits at the next
  *  boundary instead of awaiting it. */
-function driveAgent(pi: ExtensionAPI, prompt: string): Promise<void> {
+function driveAgent(pi: ExtensionAPI, prompt: string): Promise<AgentTurnResult> {
   return new Promise((resolve) => {
     let done = false;
-    const finish = () => {
+    const finish = (result: AgentTurnResult) => {
       if (done) {return;}
       done = true;
       clearInterval(timer);
       rt.turnResolve = null;
-      resolve();
+      rt.turnResult = null;
+      resolve(result);
     };
     rt.turnResolve = finish;
+    rt.turnResult = null;
     const timer = setInterval(() => {
-      if (rt.stopRequested) {finish();}
+      if (rt.stopRequested) {finish({ ok: false, error: "stopped" });}
     }, POLL_TICK_MS);
-    pi.sendUserMessage(prompt);
+    try {
+      pi.sendUserMessage(prompt);
+    } catch (error) {
+      finish({ ok: false, error: error instanceof Error ? error.message : String(error) });
+    }
   });
 }
 
 /** Build step 1 (agent turn): implement the OpenSpec change + tests green + commit.
  *  No push / PR here — those are separate persisted oneStep transitions, so a crash
  *  after this step won't re-run the creative implement work. */
-export async function buildImplement(p: PhaseCtx): Promise<void> {
+export async function buildImplement(p: PhaseCtx): Promise<AgentTurnResult> {
   const { pi, ctx, change, wtDir } = p;
   const prompt = [
     `Implement the OpenSpec change "${change}" by following the openspec-apply-change skill.`,
@@ -47,11 +53,11 @@ export async function buildImplement(p: PhaseCtx): Promise<void> {
     "Then commit with a clear conventional message and stop. (Push and PR are handled separately.)",
   ].join("\n");
   ctx.ui.notify(`dev-loop: building ${change} (driving agent in worktree…)`, "info");
-  await driveAgent(pi, prompt);
+  return driveAgent(pi, prompt);
 }
 
 /** Review→fix agent turn. Reads prNum/round/suggestions from the persisted state. */
-export async function fixPhase(p: PhaseCtx, s: LoopState): Promise<void> {
+export async function fixPhase(p: PhaseCtx, s: LoopState): Promise<AgentTurnResult> {
   const { pi, ctx, change, wtDir } = p;
   const prompt = [
     `Codex review (round ${s.round}) on PR #${s.prNum} for change "${change}" raised the comments below.`,
@@ -61,7 +67,7 @@ export async function fixPhase(p: PhaseCtx, s: LoopState): Promise<void> {
     formatSuggestions(s.suggestions),
   ].join("\n");
   ctx.ui.notify(`dev-loop: addressing round ${s.round} review (driving agent…)`, "info");
-  await driveAgent(pi, prompt);
+  return driveAgent(pi, prompt);
 }
 
 /** Review inner: origin/main advanced and conflicts with this change. The agent
@@ -69,11 +75,11 @@ export async function fixPhase(p: PhaseCtx, s: LoopState): Promise<void> {
  *  context — the change's openspec intent AND what main changed — so it doesn't
  *  sacrifice already-merged main code. If a conflict needs a human judgment call,
  *  the agent leaves it unmerged and stops. */
-export async function resolveMainPhase(p: PhaseCtx): Promise<void> {
+export async function resolveMainPhase(p: PhaseCtx): Promise<AgentTurnResult> {
   const { pi, ctx, change, wtDir } = p;
   const prompt = [
     `origin/main advanced and conflicts with the "${change}" change in this worktree.`,
-    `First run \`git merge origin/main\` (it will conflict), then resolve honoring BOTH sides — don't sacrifice already-merged main code for this change.`,
+    `If a merge is not already in progress, first run \`git merge origin/main\` (it will conflict). Then resolve honoring BOTH sides — don't sacrifice already-merged main code for this change.`,
     "",
     `Work inside the worktree (absolute paths; prefix shell with \`cd ${wtDir} &&\`): ${wtDir}`,
     "",
@@ -92,7 +98,7 @@ export async function resolveMainPhase(p: PhaseCtx): Promise<void> {
     "Do NOT push — the loop pushes after.",
   ].join("\n");
   ctx.ui.notify(`dev-loop: resolving origin/main merge conflicts for ${change} (driving agent…)`, "info");
-  await driveAgent(pi, prompt);
+  return driveAgent(pi, prompt);
 }
 
 /** Precondition checks shared by the normal run and /loop resume. */

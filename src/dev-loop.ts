@@ -1,4 +1,4 @@
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { AgentEndEvent, ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { existsSync, readdirSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { FETCH_SENTINEL, STOP_SENTINEL, WORKTREE_ROOT, rt, type LoopCtx, type LoopState } from "./runtime.ts";
@@ -182,10 +182,23 @@ export default function (pi: ExtensionAPI): void {
   rt.piRef = pi;
   rt.wakeLoop = runLoopChain; // control/timer trigger the pipeline via this callback (no import cycle)
 
-  pi.on("agent_end", () => {
+  pi.on("agent_end", (event: AgentEndEvent) => {
+    const assistant = [...event.messages].reverse().find((message) => message.role === "assistant");
+    if (!assistant || assistant.role !== "assistant") {
+      rt.turnResult = { ok: false, error: "agent ended without an assistant result" };
+      return;
+    }
+    const failed = assistant.stopReason === "error" || assistant.stopReason === "aborted";
+    rt.turnResult = { ok: !failed, error: failed ? assistant.errorMessage ?? assistant.stopReason : null };
+  });
+
+  // agent_end may be followed by an automatic retry. Only advance the state
+  // machine after agent_settled confirms that no retry/continuation remains.
+  pi.on("agent_settled", () => {
     const r = rt.turnResolve;
+    if (!r) {return;}
     rt.turnResolve = null;
-    r && r();
+    r(rt.turnResult ?? { ok: false, error: "agent settled without a result" });
   });
 
   // loopActive is true across a whole run, including the suspended review_wait

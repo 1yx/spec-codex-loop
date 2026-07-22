@@ -1,6 +1,7 @@
 {
   "name": "spec-codex-loop",
   "version": "0.2.0",
+  "type": "module",
   "description": "pi extension: autonomous TODO.md -> OpenSpec -> PR -> Codex review -> merge loop",
   "license": "MIT",
   "keywords": [
@@ -10,6 +11,11 @@
     "extensions": [
       "./src/dev-loop.ts"
     ]
+  },
+  "scripts": {
+    "test": "node lifecycle-state.test.ts && node loop-wait.test.ts && node pipeline-recovery.test.ts && node loop-resume-phases.test.ts && node loop-resume-failures.test.ts",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint src *.ts"
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "^0.80.10",

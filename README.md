@@ -26,6 +26,8 @@ A [pi](https://pi.dev) extension that runs an **autonomous spec-driven PR loop**
 
 任意 REVIEW 状态 stop(timeout / quota / codex_error / diverged / push 失败)都清 `triggerAt`+`reviewDeadline` 并留 PR+worktree,所以 `/loop resume` 会重触发 `@codex review`,不在陈旧触发上死循环。
 
+agent 驱动的 IMPLEMENT / RESOLVE_MAIN / FIX 会等待 pi 的自动重试全部结束。若 LLM 最终仍以 429 或其他错误停止，当前 inner state 会原样落盘并停止；`/loop resume` 从同一阶段继续。FIX 的 review suggestions 和首次进入时的 head 会随该重入点保存，因此错误前已经产生的提交不会被误判为无进展。FIX 成功或 stopped PROBE 恢复后会清除旧 review trigger，先协调远端 HEAD，再为当前 HEAD 发起新评审。
+
 状态流转 —— 外层(7 个 PHASE):
 
 ```mermaid
@@ -88,6 +90,16 @@ Then `/reload` inside pi (or restart) to pick it up.
 /loop resume           Resume the change last stopped via /loop stop (re-triggers @codex review on quota / bot error)
 /loop status           Show every persisted state: phase/inner, round, PR, stop reason
 ```
+
+## Tests
+
+```bash
+pnpm test
+pnpm typecheck
+pnpm lint
+```
+
+`/loop resume` 的集成测试通过注册后的真实命令入口和临时磁盘状态运行，覆盖全部 11 个持久化 phase/inner 重入点，以及 429、自动重试、部分提交、未完成 merge、Git/GitHub 瞬时失败、Codex quota/error、旧 FIX 状态、多 stopped changes、`/loop stop` 和 stale timer/sentinel 的恢复。
 
 ### First-time setup
 
