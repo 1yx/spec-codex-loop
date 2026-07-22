@@ -19,8 +19,8 @@ import {
 export function applyControl(ctx: LoopCtx, kind: "fetch" | "stop"): void {
   if (kind === "fetch") {rt.fetchRequested = true;} else {rt.stopRequested = true;}
   ctx.ui.notify(
-    kind === "stop" ? "dev-loop: stop requested — next safe boundary" : "dev-loop: fetch requested — rechecking now",
-    kind === "stop" ? "warning" : "info",
+    kind === "stop" ? "dev-loop: 已请求停止 — 将在下一个安全边界生效" : "dev-loop: fetch requested — rechecking now",
+    "info",
   );
   if (!rt.runCtx) {return;}
   // Both signals must wake a suspended loop: fetch to re-probe, stop to reach the
